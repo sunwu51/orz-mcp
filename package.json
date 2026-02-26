@@ -18,8 +18,16 @@
     "stdio",
     "model-context-protocol"
   ],
-  "author": "",
+  "author": "sunwu51",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sunwu51/orz-mcp.git"
+  },
+  "homepage": "https://github.com/sunwu51/orz-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/sunwu51/orz-mcp/issues"
+  },
   "type": "module",
   "files": [
     "client.mjs"
