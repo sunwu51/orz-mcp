@@ -1,0 +1,35 @@
+{
+  "name": "orz-mcp",
+  "version": "1.0.0",
+  "description": "MCP server with web_search and web_fetch tools. Searches Brave, Sogou, DuckDuckGo simultaneously with deduplication. Supports HTTP proxy for users behind firewalls.",
+  "main": "client.mjs",
+  "bin": {
+    "orz-mcp": "client.mjs"
+  },
+  "scripts": {
+    "start": "node client.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "web-search",
+    "web-fetch",
+    "brave-search",
+    "proxy",
+    "stdio",
+    "model-context-protocol"
+  ],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "client.mjs"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "turndown": "^7.2.2",
+    "undici": "^7.22.0"
+  }
+}
