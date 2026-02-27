@@ -1,0 +1,14 @@
+{
+  "name": "orz-mcp-server",
+  "version": "1.0.0",
+  "description": "ORZ MCP Server - Remote server version deployed on Netlify Functions",
+  "type": "module",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "fetch-to-node": "^2.0.0",
+    "hono": "^4.7.7",
+    "turndown": "^7.2.2",
+    "zod": "^3.24.3"
+  }
+}

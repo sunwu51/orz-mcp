@@ -27,7 +27,7 @@ ORZ MCP 提供 **本地 stdio 版** 和 **远程 server 版** 两种模式，功
 
 | | 本地 stdio 版 | 远程 server 版 |
 |---|---|---|
-| 运行方式 | 通过 npx 本地启动 | 远程 HTTP 服务 |
+| 运行方式 | 通过 npx 本地启动 | 远程 HTTP 服务（Netlify Functions） |
 | 适用场景 | 需要代理访问海外搜索引擎 | 开箱即用，无需本地环境 |
 | 代理支持 | 支持 `--proxy` 参数 | 不支持（服务端已部署在海外） |
 | 依赖 | Node.js >= 18 | 无 |
@@ -74,14 +74,27 @@ ORZ MCP 提供 **本地 stdio 版** 和 **远程 server 版** 两种模式，功
 
 ### 方式二：远程 server 版（直接连接）
 
-无需本地安装任何东西，直接连接远程服务。
+无需本地安装任何东西，直接连接部署在 Netlify 上的远程服务。
 
 ```json
 {
   "mcpServers": {
     "orz": {
       "type": "http",
-      "url": "https://orz.xiaogenban.deno.net/mcp"
+      "url": "https://<your-netlify-domain>/mcp"
+    }
+  }
+}
+```
+
+如果你的 MCP 客户端不支持直接 URL 连接，可以通过 `mcp-remote` 桥接：
+
+```json
+{
+  "mcpServers": {
+    "orz": {
+      "command": "npx",
+      "args": ["mcp-remote@next", "https://<your-netlify-domain>/mcp"]
     }
   }
 }
@@ -101,27 +114,67 @@ ORZ MCP 提供 **本地 stdio 版** 和 **远程 server 版** 两种模式，功
 
 ```
 orz-mcp/
-├── client.mjs       # 本地 stdio 版 (Node.js)
-├── server.ts        # 远程 server 版 (Deno, Streamable HTTP)
-├── server_test.ts   # 测试文件
-├── package.json     # npm 包配置
-└── deno.json        # Deno 配置
+├── client/                             # 本地 stdio 版 (npm 包)
+│   ├── client.mjs                      # 入口文件
+│   └── package.json                    # npm 发布配置（依赖: mcp sdk, turndown, undici）
+├── server/                             # 远程 server 版 (Netlify Functions)
+│   ├── netlify/
+│   │   ├── mcp-server/
+│   │   │   └── index.ts                # MCP Server 定义（工具注册与业务逻辑）
+│   │   └── functions/
+│   │       └── hono-mcp-server.ts      # Hono HTTP handler (Netlify Function)
+│   ├── public/
+│   │   └── index.html                  # 静态首页
+│   ├── netlify.toml                    # Netlify 构建配置
+│   └── package.json                    # 服务端依赖（依赖: mcp sdk, hono, zod, turndown）
+└── README.md
 ```
 
 ## 开发
 
+### 本地 stdio 版
+
 ```bash
-# 启动远程 server 版（本地开发）
-deno task start
+cd client
+npm install
 
-# 运行测试
-deno test --allow-read --allow-net --allow-env server_test.ts
-
-# 启动本地 stdio 版
 node client.mjs
 node client.mjs --proxy http://127.0.0.1:7890
 node client.mjs --help
 ```
+
+### 远程 server 版（本地调试）
+
+```bash
+cd server
+npm install
+
+# 启动本地开发服务器（需要 Netlify CLI）
+netlify dev
+
+# 用 MCP Inspector 测试
+npx @modelcontextprotocol/inspector npx mcp-remote@next http://localhost:8888/mcp
+```
+
+## 部署到 Netlify
+
+```bash
+cd server
+
+# 安装 Netlify CLI
+npm install -g netlify-cli
+
+# 登录
+netlify login
+
+# 初始化并关联站点
+netlify init
+
+# 部署
+netlify deploy --prod
+```
+
+或者通过 GitHub 连接 Netlify，push 到 main 分支自动部署。
 
 ## License
 
