@@ -141,6 +141,9 @@ npm install
 node client.mjs
 node client.mjs --proxy http://127.0.0.1:7890
 node client.mjs --help
+
+# 用 MCP Inspector 调试
+npx @modelcontextprotocol/inspector node client.mjs
 ```
 
 ### Streamable HTTP（本地调试）
@@ -152,8 +155,8 @@ npm install
 # 启动本地开发服务器（需要 Netlify CLI）
 netlify dev
 
-# 用 MCP Inspector 测试
-npx @modelcontextprotocol/inspector npx mcp-remote@next http://localhost:8888/mcp
+# 用 MCP Inspector 测试（在 UI 中选择 Streamable HTTP，填入 URL）
+npx @modelcontextprotocol/inspector --url http://localhost:8888/mcp
 ```
 
 ## 部署到 Netlify

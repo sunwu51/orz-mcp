@@ -353,14 +353,14 @@ async function webSearch(
   numResults: number = 8
 ): Promise<SearchItem[]> {
   console.log(`[web_search] query="${query}", numResults=${numResults}`);
-  const [brave, sogou, ddg] = await Promise.allSettled([
+  const [brave, ddg] = await Promise.allSettled([
     searchBrave(query),
-    searchSogou(query),
+    // searchSogou(query), // TODO: 搜狗在 Netlify 上搜索非常慢，暂时禁用
     searchDuckDuckGo(query),
   ]);
   const allResults: SearchItem[][] = [];
-  const engineNames = ["Brave", "Sogou", "DuckDuckGo"];
-  const engineResults = [brave, sogou, ddg];
+  const engineNames = ["Brave", "DuckDuckGo"];
+  const engineResults = [brave, ddg];
   for (let i = 0; i < engineResults.length; i++) {
     const result = engineResults[i];
     if (result.status === "fulfilled") {
