@@ -23,9 +23,9 @@
 
 ## 两种使用方式（二选一）
 
-ORZ MCP 提供 **本地 stdio 版** 和 **远程 server 版** 两种模式，功能完全一致，根据你的需求选择其中一种即可。
+ORZ MCP 提供 **stdio** 和 **Streamable HTTP** 两种 MCP 传输协议的实现，功能完全一致，根据你的需求选择其中一种即可。
 
-| | 本地 stdio 版 | 远程 server 版 |
+| | stdio | Streamable HTTP |
 |---|---|---|
 | 运行方式 | 通过 npx 本地启动 | 远程 HTTP 服务（Netlify Functions） |
 | 适用场景 | 需要代理访问海外搜索引擎 | 开箱即用，无需本地环境 |
@@ -34,7 +34,7 @@ ORZ MCP 提供 **本地 stdio 版** 和 **远程 server 版** 两种模式，功
 
 ---
 
-### 方式一：本地 stdio 版（通过 npx 运行）
+### 方式一：stdio（通过 npx 本地运行）
 
 无需安装，直接通过 `npx` 运行。适合需要配置代理的用户。
 
@@ -72,7 +72,7 @@ ORZ MCP 提供 **本地 stdio 版** 和 **远程 server 版** 两种模式，功
 
 ---
 
-### 方式二：远程 server 版（直接连接）
+### 方式二：Streamable HTTP（远程连接）
 
 无需本地安装任何东西，直接连接部署在 Netlify 上的远程服务。
 
@@ -114,10 +114,10 @@ ORZ MCP 提供 **本地 stdio 版** 和 **远程 server 版** 两种模式，功
 
 ```
 orz-mcp/
-├── client/                             # 本地 stdio 版 (npm 包)
+├── stdio/                              # stdio 传输协议 (npm 包)
 │   ├── client.mjs                      # 入口文件
 │   └── package.json                    # npm 发布配置（依赖: mcp sdk, turndown, undici）
-├── server/                             # 远程 server 版 (Netlify Functions)
+├── streamable-http/                    # Streamable HTTP 传输协议 (Netlify Functions)
 │   ├── netlify/
 │   │   ├── mcp-server/
 │   │   │   └── index.ts                # MCP Server 定义（工具注册与业务逻辑）
@@ -132,10 +132,10 @@ orz-mcp/
 
 ## 开发
 
-### 本地 stdio 版
+### stdio
 
 ```bash
-cd client
+cd stdio
 npm install
 
 node client.mjs
@@ -143,10 +143,10 @@ node client.mjs --proxy http://127.0.0.1:7890
 node client.mjs --help
 ```
 
-### 远程 server 版（本地调试）
+### Streamable HTTP（本地调试）
 
 ```bash
-cd server
+cd streamable-http
 npm install
 
 # 启动本地开发服务器（需要 Netlify CLI）
@@ -159,7 +159,7 @@ npx @modelcontextprotocol/inspector npx mcp-remote@next http://localhost:8888/mc
 ## 部署到 Netlify
 
 ```bash
-cd server
+cd streamable-http
 
 # 安装 Netlify CLI
 npm install -g netlify-cli
