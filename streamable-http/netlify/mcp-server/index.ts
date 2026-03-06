@@ -22,6 +22,7 @@ const USER_AGENTS = [
 ];
 
 const DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/";
+const DUCKDUCKGO_FALLBACK_SEARCH_URL = "https://ddg.workers.rocks/";
 
 function getRandomUA(): string {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
@@ -243,47 +244,34 @@ async function fetchDuckDuckGoHtml(url: string): Promise<string> {
   return resp.text();
 }
 
-async function retryDuckDuckGoViaProxy(
-  query: string,
-  proxyOrigin?: string
-): Promise<SearchItem[]> {
-  if (!proxyOrigin) {
-    return [];
-  }
-
-  const proxyUrl = new URL("/ddg", proxyOrigin);
-  proxyUrl.searchParams.set("q", query);
+async function retryDuckDuckGoViaFallback(query: string): Promise<SearchItem[]> {
+  const fallbackUrl = new URL(DUCKDUCKGO_FALLBACK_SEARCH_URL);
+  fallbackUrl.searchParams.set("q", query);
 
   try {
-    console.log(`[DuckDuckGo] Retrying via edge proxy: ${proxyUrl}`);
-    const html = await fetchDuckDuckGoHtml(proxyUrl.toString());
+    console.log(`[DuckDuckGo] Retrying via fallback: ${fallbackUrl}`);
+    const html = await fetchDuckDuckGoHtml(fallbackUrl.toString());
     return parseDuckDuckGo(html);
   } catch (e) {
-    console.error(
-      "[DuckDuckGo] edge proxy retry error:",
-      (e as Error).message
-    );
+    console.error("[DuckDuckGo] fallback retry error:", (e as Error).message);
     return [];
   }
 }
 
-async function searchDuckDuckGo(
-  query: string,
-  proxyOrigin?: string
-): Promise<SearchItem[]> {
+async function searchDuckDuckGo(query: string): Promise<SearchItem[]> {
   try {
     const url = `${DUCKDUCKGO_HTML_SEARCH_URL}?q=${encodeURIComponent(query)}`;
     const html = await fetchDuckDuckGoHtml(url);
 
     if (isDuckDuckGoCaptchaHtml(html)) {
-      console.log("[DuckDuckGo] Got captcha page, retrying via /ddg");
-      return retryDuckDuckGoViaProxy(query, proxyOrigin);
+      console.log("[DuckDuckGo] Got captcha page, retrying via fallback URL");
+      return retryDuckDuckGoViaFallback(query);
     }
 
     return parseDuckDuckGo(html);
   } catch (e) {
     console.error("[DuckDuckGo] search error:", (e as Error).message);
-    return [];
+    return retryDuckDuckGoViaFallback(query);
   }
 }
 
@@ -348,13 +336,12 @@ function mergeAndDeduplicate(
 
 async function webSearch(
   query: string,
-  numResults: number = 8,
-  proxyOrigin?: string
+  numResults: number = 8
 ): Promise<SearchItem[]> {
   console.log(`[web_search] query="${query}", numResults=${numResults}`);
   const [brave, ddg] = await Promise.allSettled([
     searchBrave(query),
-    searchDuckDuckGo(query, proxyOrigin),
+    searchDuckDuckGo(query),
   ]);
   const allResults: SearchItem[][] = [];
   const engineNames = ["Brave", "DuckDuckGo"];
@@ -495,7 +482,7 @@ async function webFetch(
 // MCP Server setup
 // ============================================================================
 
-export const setupMCPServer = (proxyOrigin?: string): McpServer => {
+export const setupMCPServer = (): McpServer => {
   const server = new McpServer(
     {
       name: "orz",
@@ -544,7 +531,7 @@ export const setupMCPServer = (proxyOrigin?: string): McpServer => {
         };
       }
       try {
-        const results = await webSearch(query, num_results, proxyOrigin);
+        const results = await webSearch(query, num_results);
         return {
           content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
           structuredContent: {
