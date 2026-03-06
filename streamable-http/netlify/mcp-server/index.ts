@@ -21,6 +21,8 @@ const USER_AGENTS = [
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
 ];
 
+const DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/";
+
 function getRandomUA(): string {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
@@ -79,6 +81,13 @@ function decodeHtmlEntities(text: string): string {
 
 function stripHtml(html: string): string {
   return decodeHtmlEntities(html.replace(/<[^>]+>/g, "")).trim();
+}
+
+function isDuckDuckGoCaptchaHtml(html: string): boolean {
+  return (
+    html.includes("anomaly-modal") ||
+    html.includes("Please complete the following challenge")
+  );
 }
 
 // ============================================================================
@@ -158,10 +167,7 @@ function parseBrave(html: string): SearchItem[] {
 
 function parseDuckDuckGo(html: string): SearchItem[] {
   const results: SearchItem[] = [];
-  if (
-    html.includes("anomaly-modal") ||
-    html.includes("Please complete the following challenge")
-  ) {
+  if (isDuckDuckGoCaptchaHtml(html)) {
     console.log("[DuckDuckGo] Got captcha page, skipping");
     return results;
   }
@@ -224,15 +230,56 @@ async function searchBrave(query: string): Promise<SearchItem[]> {
   }
 }
 
-async function searchDuckDuckGo(query: string): Promise<SearchItem[]> {
+async function fetchDuckDuckGoHtml(url: string): Promise<string> {
+  const resp = await fetch(url, {
+    headers: getBrowserHeaders(),
+    signal: AbortSignal.timeout(10000),
+  });
+
+  if (!resp.ok) {
+    throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+  }
+
+  return resp.text();
+}
+
+async function retryDuckDuckGoViaProxy(
+  query: string,
+  proxyOrigin?: string
+): Promise<SearchItem[]> {
+  if (!proxyOrigin) {
+    return [];
+  }
+
+  const proxyUrl = new URL("/ddg", proxyOrigin);
+  proxyUrl.searchParams.set("q", query);
+
   try {
-    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    const resp = await fetch(url, {
-      headers: getBrowserHeaders(),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!resp.ok) return [];
-    const html = await resp.text();
+    console.log(`[DuckDuckGo] Retrying via edge proxy: ${proxyUrl}`);
+    const html = await fetchDuckDuckGoHtml(proxyUrl.toString());
+    return parseDuckDuckGo(html);
+  } catch (e) {
+    console.error(
+      "[DuckDuckGo] edge proxy retry error:",
+      (e as Error).message
+    );
+    return [];
+  }
+}
+
+async function searchDuckDuckGo(
+  query: string,
+  proxyOrigin?: string
+): Promise<SearchItem[]> {
+  try {
+    const url = `${DUCKDUCKGO_HTML_SEARCH_URL}?q=${encodeURIComponent(query)}`;
+    const html = await fetchDuckDuckGoHtml(url);
+
+    if (isDuckDuckGoCaptchaHtml(html)) {
+      console.log("[DuckDuckGo] Got captcha page, retrying via /ddg");
+      return retryDuckDuckGoViaProxy(query, proxyOrigin);
+    }
+
     return parseDuckDuckGo(html);
   } catch (e) {
     console.error("[DuckDuckGo] search error:", (e as Error).message);
@@ -301,12 +348,13 @@ function mergeAndDeduplicate(
 
 async function webSearch(
   query: string,
-  numResults: number = 8
+  numResults: number = 8,
+  proxyOrigin?: string
 ): Promise<SearchItem[]> {
   console.log(`[web_search] query="${query}", numResults=${numResults}`);
   const [brave, ddg] = await Promise.allSettled([
     searchBrave(query),
-    searchDuckDuckGo(query),
+    searchDuckDuckGo(query, proxyOrigin),
   ]);
   const allResults: SearchItem[][] = [];
   const engineNames = ["Brave", "DuckDuckGo"];
@@ -447,7 +495,7 @@ async function webFetch(
 // MCP Server setup
 // ============================================================================
 
-export const setupMCPServer = (): McpServer => {
+export const setupMCPServer = (proxyOrigin?: string): McpServer => {
   const server = new McpServer(
     {
       name: "orz",
@@ -496,7 +544,7 @@ export const setupMCPServer = (): McpServer => {
         };
       }
       try {
-        const results = await webSearch(query, num_results);
+        const results = await webSearch(query, num_results, proxyOrigin);
         return {
           content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
           structuredContent: {

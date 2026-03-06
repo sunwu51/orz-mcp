@@ -3,3 +3,7 @@
 
 [dev]
   publish = "public"
+
+[[edge_functions]]
+  function = "ddg"
+  path = "/ddg"

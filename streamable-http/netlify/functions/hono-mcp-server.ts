@@ -8,7 +8,7 @@ const app = new Hono();
 
 app.post("/mcp", async (c) => {
   const { req, res } = toReqRes(c.req.raw);
-  const server = setupMCPServer();
+  const server = setupMCPServer(new URL(c.req.url).origin);
 
   try {
     const transport: StreamableHTTPServerTransport =
