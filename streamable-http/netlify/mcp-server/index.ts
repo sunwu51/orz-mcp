@@ -14,42 +14,41 @@ import TurndownService from "turndown";
 // Constants & Config
 // ============================================================================
 
-const USER_AGENTS = [
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-];
-
 const DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/";
 const DUCKDUCKGO_FALLBACK_SEARCH_URLS = [
   "https://spin-ddg-proxy-idmlnajw.fermyon.app/",
+  "https://ddg-368306689698.europe-west1.run.app/",
+  "https://olg3d54tkkk5gv452mz42sdu6a0xzlsu.lambda-url.us-east-1.on.aws/",
   "https://ddg.workers.rocks/",
   "https://ddg2.workers.rocks/",
-  "https://ddg3.workers.rocks/",
-  "https://ddg4.workers.rocks/",
-  "https://ddg5.workers.rocks/",
 ];
 
-function getRandomUA(): string {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
+const mockHeaders = {
+    'User-Agent':
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept':
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+    'Referer': 'https://duckduckgo.com/',
+    'Origin': 'https://duckduckgo.com',
+    'Upgrade-Insecure-Requests': '1',
+    'DNT': '1',
+    'Cookie': 'kl=us-en',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-User': '?1',
+    'sec-ch-ua':
+        '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"macOS"',
+};
 
 function getBrowserHeaders(): Record<string, string> {
-  return {
-    "User-Agent": getRandomUA(),
-    Accept:
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "no-cache",
-    Pragma: "no-cache",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-  };
+  return mockHeaders;
 }
 
 function getElapsedMs(startTime: number): number {
@@ -275,6 +274,12 @@ async function fetchDuckDuckGoHtml(url: string): Promise<string> {
   return resp.text();
 }
 
+type DuckDuckGoSearchAttempt =
+  | { kind: "success"; results: SearchItem[] }
+  | { kind: "captcha" }
+  | { kind: "empty"; results: SearchItem[] }
+  | { kind: "error" };
+
 function buildDuckDuckGoSearchUrl(baseUrl: string, query: string): string {
   const url = new URL(baseUrl);
   url.searchParams.set("q", query);
@@ -284,34 +289,39 @@ function buildDuckDuckGoSearchUrl(baseUrl: string, query: string): string {
 async function tryDuckDuckGoSearchUrl(
   url: string,
   source: string
-): Promise<SearchItem[]> {
+): Promise<DuckDuckGoSearchAttempt> {
   try {
     console.log(`[DuckDuckGo] Trying ${source}: ${url}`);
     const html = await fetchDuckDuckGoHtml(url);
 
     if (isDuckDuckGoCaptchaHtml(html)) {
       console.log(`[DuckDuckGo] ${source} returned captcha`);
-      return [];
+      return { kind: "captcha" };
     }
 
     const results = parseDuckDuckGo(html);
     if (results.length === 0) {
       console.log(`[DuckDuckGo] ${source} returned 0 results`);
+      return { kind: "empty", results };
     }
 
-    return results;
+    return { kind: "success", results };
   } catch (e) {
     console.error(`[DuckDuckGo] ${source} error:`, (e as Error).message);
-    return [];
+    return { kind: "error" };
   }
 }
 
 async function retryDuckDuckGoViaFallbacks(query: string): Promise<SearchItem[]> {
-  for (const fallbackBaseUrl of DUCKDUCKGO_FALLBACK_SEARCH_URLS) {
+  const fallbackBaseUrls = [...DUCKDUCKGO_FALLBACK_SEARCH_URLS].sort(() => Math.random() - 0.5);
+  for (const fallbackBaseUrl of fallbackBaseUrls) {
     const fallbackUrl = buildDuckDuckGoSearchUrl(fallbackBaseUrl, query);
-    const results = await tryDuckDuckGoSearchUrl(fallbackUrl, "fallback");
-    if (results.length > 0) {
-      return results;
+    const attempt = await tryDuckDuckGoSearchUrl(fallbackUrl, "fallback");
+    if (attempt.kind === "success" || attempt.kind === "empty") {
+      return attempt.results;
+    }
+    if (attempt.kind !== "captcha") {
+      return [];
     }
   }
 
@@ -320,10 +330,14 @@ async function retryDuckDuckGoViaFallbacks(query: string): Promise<SearchItem[]>
 
 async function searchDuckDuckGo(query: string): Promise<SearchItem[]> {
   const primaryUrl = buildDuckDuckGoSearchUrl(DUCKDUCKGO_HTML_SEARCH_URL, query);
-  const primaryResults = await tryDuckDuckGoSearchUrl(primaryUrl, "primary");
+  const primaryAttempt = await tryDuckDuckGoSearchUrl(primaryUrl, "primary");
 
-  if (primaryResults.length > 0) {
-    return primaryResults;
+  if (primaryAttempt.kind === "success" || primaryAttempt.kind === "empty") {
+    return primaryAttempt.results;
+  }
+
+  if (primaryAttempt.kind !== "captcha") {
+    return [];
   }
 
   return retryDuckDuckGoViaFallbacks(query);
