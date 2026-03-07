@@ -23,8 +23,12 @@ const USER_AGENTS = [
 
 const DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/";
 const DUCKDUCKGO_FALLBACK_SEARCH_URLS = [
-  "https://ddg.workers.rocks/",
   "https://spin-ddg-proxy-idmlnajw.fermyon.app/",
+  "https://ddg.workers.rocks/",
+  "https://ddg2.workers.rocks/",
+  "https://ddg3.workers.rocks/",
+  "https://ddg4.workers.rocks/",
+  "https://ddg5.workers.rocks/",
 ];
 
 function getRandomUA(): string {
