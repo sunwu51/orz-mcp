@@ -22,7 +22,10 @@ const USER_AGENTS = [
 ];
 
 const DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/";
-const DUCKDUCKGO_FALLBACK_SEARCH_URL = "https://ddg.workers.rocks/";
+const DUCKDUCKGO_FALLBACK_SEARCH_URLS = [
+  "https://ddg.workers.rocks/",
+  "https://spin-ddg-proxy-idmlnajw.fermyon.app/",
+];
 
 function getRandomUA(): string {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
@@ -43,6 +46,30 @@ function getBrowserHeaders(): Record<string, string> {
     "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
   };
+}
+
+function getElapsedMs(startTime: number): number {
+  return Date.now() - startTime;
+}
+
+async function timedFetch(
+  label: string,
+  url: string,
+  init?: RequestInit
+): Promise<Response> {
+  const startTime = Date.now();
+  try {
+    const response = await fetch(url, init);
+    console.log(
+      `[fetch] ${label} completed in ${getElapsedMs(startTime)}ms (${response.status}) url="${url}"`
+    );
+    return response;
+  } catch (e) {
+    console.error(
+      `[fetch] ${label} failed in ${getElapsedMs(startTime)}ms url="${url}": ${(e as Error).message}`
+    );
+    throw e;
+  }
 }
 
 // ============================================================================
@@ -218,7 +245,7 @@ function parseDuckDuckGo(html: string): SearchItem[] {
 async function searchBrave(query: string): Promise<SearchItem[]> {
   try {
     const url = `https://search.brave.com/search?q=${encodeURIComponent(query)}`;
-    const resp = await fetch(url, {
+    const resp = await timedFetch("Brave search", url, {
       headers: getBrowserHeaders(),
       signal: AbortSignal.timeout(10000),
     });
@@ -232,7 +259,7 @@ async function searchBrave(query: string): Promise<SearchItem[]> {
 }
 
 async function fetchDuckDuckGoHtml(url: string): Promise<string> {
-  const resp = await fetch(url, {
+  const resp = await timedFetch("DuckDuckGo search", url, {
     headers: getBrowserHeaders(),
     signal: AbortSignal.timeout(10000),
   });
@@ -244,35 +271,58 @@ async function fetchDuckDuckGoHtml(url: string): Promise<string> {
   return resp.text();
 }
 
-async function retryDuckDuckGoViaFallback(query: string): Promise<SearchItem[]> {
-  const fallbackUrl = new URL(DUCKDUCKGO_FALLBACK_SEARCH_URL);
-  fallbackUrl.searchParams.set("q", query);
+function buildDuckDuckGoSearchUrl(baseUrl: string, query: string): string {
+  const url = new URL(baseUrl);
+  url.searchParams.set("q", query);
+  return url.toString();
+}
 
+async function tryDuckDuckGoSearchUrl(
+  url: string,
+  source: string
+): Promise<SearchItem[]> {
   try {
-    console.log(`[DuckDuckGo] Retrying via fallback: ${fallbackUrl}`);
-    const html = await fetchDuckDuckGoHtml(fallbackUrl.toString());
-    return parseDuckDuckGo(html);
+    console.log(`[DuckDuckGo] Trying ${source}: ${url}`);
+    const html = await fetchDuckDuckGoHtml(url);
+
+    if (isDuckDuckGoCaptchaHtml(html)) {
+      console.log(`[DuckDuckGo] ${source} returned captcha`);
+      return [];
+    }
+
+    const results = parseDuckDuckGo(html);
+    if (results.length === 0) {
+      console.log(`[DuckDuckGo] ${source} returned 0 results`);
+    }
+
+    return results;
   } catch (e) {
-    console.error("[DuckDuckGo] fallback retry error:", (e as Error).message);
+    console.error(`[DuckDuckGo] ${source} error:`, (e as Error).message);
     return [];
   }
 }
 
-async function searchDuckDuckGo(query: string): Promise<SearchItem[]> {
-  try {
-    const url = `${DUCKDUCKGO_HTML_SEARCH_URL}?q=${encodeURIComponent(query)}`;
-    const html = await fetchDuckDuckGoHtml(url);
-
-    if (isDuckDuckGoCaptchaHtml(html)) {
-      console.log("[DuckDuckGo] Got captcha page, retrying via fallback URL");
-      return retryDuckDuckGoViaFallback(query);
+async function retryDuckDuckGoViaFallbacks(query: string): Promise<SearchItem[]> {
+  for (const fallbackBaseUrl of DUCKDUCKGO_FALLBACK_SEARCH_URLS) {
+    const fallbackUrl = buildDuckDuckGoSearchUrl(fallbackBaseUrl, query);
+    const results = await tryDuckDuckGoSearchUrl(fallbackUrl, "fallback");
+    if (results.length > 0) {
+      return results;
     }
-
-    return parseDuckDuckGo(html);
-  } catch (e) {
-    console.error("[DuckDuckGo] search error:", (e as Error).message);
-    return retryDuckDuckGoViaFallback(query);
   }
+
+  return [];
+}
+
+async function searchDuckDuckGo(query: string): Promise<SearchItem[]> {
+  const primaryUrl = buildDuckDuckGoSearchUrl(DUCKDUCKGO_HTML_SEARCH_URL, query);
+  const primaryResults = await tryDuckDuckGoSearchUrl(primaryUrl, "primary");
+
+  if (primaryResults.length > 0) {
+    return primaryResults;
+  }
+
+  return retryDuckDuckGoViaFallbacks(query);
 }
 
 // ============================================================================
@@ -338,28 +388,41 @@ async function webSearch(
   query: string,
   numResults: number = 8
 ): Promise<SearchItem[]> {
+  const startTime = Date.now();
   console.log(`[web_search] query="${query}", numResults=${numResults}`);
-  const [brave, ddg] = await Promise.allSettled([
-    searchBrave(query),
-    searchDuckDuckGo(query),
-  ]);
-  const allResults: SearchItem[][] = [];
-  const engineNames = ["Brave", "DuckDuckGo"];
-  const engineResults = [brave, ddg];
-  for (let i = 0; i < engineResults.length; i++) {
-    const result = engineResults[i];
-    if (result.status === "fulfilled") {
-      allResults.push(result.value);
-      console.log(
-        `[web_search] ${engineNames[i]}: ${result.value.length} results`
-      );
-    } else {
-      console.log(
-        `[web_search] ${engineNames[i]}: failed - ${result.reason}`
-      );
+  try {
+    const [brave, ddg] = await Promise.allSettled([
+      searchBrave(query),
+      searchDuckDuckGo(query),
+    ]);
+    const allResults: SearchItem[][] = [];
+    const engineNames = ["Brave", "DuckDuckGo"];
+    const engineResults = [brave, ddg];
+    for (let i = 0; i < engineResults.length; i++) {
+      const result = engineResults[i];
+      if (result.status === "fulfilled") {
+        allResults.push(result.value);
+        console.log(
+          `[web_search] ${engineNames[i]}: ${result.value.length} results`
+        );
+      } else {
+        console.log(
+          `[web_search] ${engineNames[i]}: failed - ${result.reason}`
+        );
+      }
     }
+
+    const mergedResults = mergeAndDeduplicate(allResults, numResults);
+    console.log(
+      `[web_search] total completed in ${getElapsedMs(startTime)}ms, merged=${mergedResults.length}`
+    );
+    return mergedResults;
+  } catch (e) {
+    console.error(
+      `[web_search] total failed in ${getElapsedMs(startTime)}ms: ${(e as Error).message}`
+    );
+    throw e;
   }
-  return mergeAndDeduplicate(allResults, numResults);
 }
 
 // ============================================================================
@@ -440,13 +503,14 @@ async function webFetch(
   maxCharSize: number = 50000,
   simplify: boolean = true
 ): Promise<string> {
+  const startTime = Date.now();
   console.log(
     `[web_fetch] url="${url}", maxCharSize=${maxCharSize}, simplify=${simplify}`
   );
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
   try {
-    const resp = await fetch(url, {
+    const resp = await timedFetch("web_fetch", url, {
       headers: getBrowserHeaders(),
       signal: controller.signal,
       redirect: "follow",
@@ -458,19 +522,34 @@ async function webFetch(
     const contentType = resp.headers.get("content-type") ?? "";
     if (!contentType.includes("html")) {
       const text = await resp.text();
-      return text.substring(0, maxCharSize);
+      const result = text.substring(0, maxCharSize);
+      console.log(
+        `[web_fetch] total completed in ${getElapsedMs(startTime)}ms, contentLength=${result.length}`
+      );
+      return result;
     }
     let html = await resp.text();
     if (simplify) {
       html = removeUselessTags(html);
       const mainContent = extractMainContent(html);
       const markdown = htmlToMarkdown(mainContent);
-      return markdown.substring(0, maxCharSize);
+      const result = markdown.substring(0, maxCharSize);
+      console.log(
+        `[web_fetch] total completed in ${getElapsedMs(startTime)}ms, contentLength=${result.length}`
+      );
+      return result;
     } else {
-      return html.substring(0, maxCharSize);
+      const result = html.substring(0, maxCharSize);
+      console.log(
+        `[web_fetch] total completed in ${getElapsedMs(startTime)}ms, contentLength=${result.length}`
+      );
+      return result;
     }
   } catch (e) {
     clearTimeout(timeoutId);
+    console.error(
+      `[web_fetch] total failed in ${getElapsedMs(startTime)}ms: ${(e as Error).message}`
+    );
     if ((e as Error).name === "AbortError") {
       throw new Error(`Timeout: Failed to fetch "${url}" within 10 seconds.`);
     }
