@@ -1,10 +1,35 @@
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { handle } from "hono/netlify";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { toFetchResponse, toReqRes } from "fetch-to-node";
 import { setupMCPServer } from "../mcp-server/index.js";
 
 const app = new Hono();
+
+app.use(
+  "/mcp",
+  cors({
+    origin: "*",
+    allowMethods: ["POST", "GET", "DELETE", "OPTIONS"],
+    allowHeaders: [
+      "Content-Type",
+      "Accept",
+      "Authorization",
+      "Mcp-Session-Id",
+      "MCP-Session-Id",
+      "mcp-session-id",
+      "Last-Event-ID",
+    ],
+    exposeHeaders: [
+      "Content-Type",
+      "Mcp-Session-Id",
+      "MCP-Session-Id",
+      "mcp-session-id",
+    ],
+    maxAge: 86400,
+  })
+);
 
 app.post("/mcp", async (c) => {
   const { req, res } = toReqRes(c.req.raw);
