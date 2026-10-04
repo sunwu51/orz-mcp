@@ -9,10 +9,32 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import TurndownService from "turndown";
+import { ProxyAgent, fetch as undiciFetch } from "undici";
 
 // ============================================================================
-// Constants & Config
+// Proxy & Config
 // ============================================================================
+
+const PROXY_URL =
+  process.env.PROXY_URL ||
+  process.env.HTTPS_PROXY ||
+  process.env.https_proxy ||
+  process.env.HTTP_PROXY ||
+  process.env.http_proxy ||
+  process.env.ALL_PROXY ||
+  process.env.all_proxy ||
+  "";
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+
+const proxyDispatcher = PROXY_URL ? new ProxyAgent(PROXY_URL) : undefined;
+
+if (PROXY_URL) {
+  console.log(`[streamable-http] Using proxy: ${PROXY_URL}`);
+}
+if (GEMINI_API_KEY) {
+  console.log(`[streamable-http] Google search: Gemini API Grounding enabled`);
+}
 
 const DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/";
 const DUCKDUCKGO_FALLBACK_SEARCH_URLS = [
@@ -62,7 +84,13 @@ async function timedFetch(
 ): Promise<Response> {
   const startTime = Date.now();
   try {
-    const response = await fetch(url, init);
+    const fetchOptions: any = { ...init };
+    if (proxyDispatcher) {
+      fetchOptions.dispatcher = proxyDispatcher;
+    }
+    const response = (proxyDispatcher
+      ? await undiciFetch(url, fetchOptions)
+      : await fetch(url, init)) as unknown as Response;
     console.log(
       `[fetch] ${label} completed in ${getElapsedMs(startTime)}ms (${response.status}) url="${url}"`
     );
@@ -160,41 +188,7 @@ function isAdUrl(url: string): boolean {
 // Search engine parsers
 // ============================================================================
 
-function parseBrave(html: string): SearchItem[] {
-  const results: SearchItem[] = [];
-  const blocks = html.split('data-type="web"');
-  for (let i = 1; i < blocks.length; i++) {
-    const block = blocks[i].substring(0, 5000);
-    const urlMatch = block.match(
-      /<a[^>]+href="(https?:\/\/(?!search\.brave\.com|brave\.com)[^"]+)"/
-    );
-    if (!urlMatch) continue;
-    const url = decodeHtmlEntities(urlMatch[1]);
-    const aTagMatch = block.match(
-      /<a[^>]+href="(https?:\/\/(?!search\.brave\.com|brave\.com)[^"]+)"[^>]*>([\s\S]*?)<\/a>/
-    );
-    const title = aTagMatch ? stripHtml(aTagMatch[2]) : "";
-    let summary = "";
-    const descMatch = block.match(
-      /class="[^"]*snippet-description[^"]*"[^>]*>([\s\S]*?)<\/(?:p|div|span)>/
-    );
-    if (descMatch) {
-      summary = stripHtml(descMatch[1]);
-    }
-    if (!summary) {
-      const genericMatch = block.match(
-        /class="[^"]*generic-snippet[^"]*"[^>]*>([\s\S]*?)<\/div>/
-      );
-      if (genericMatch) {
-        summary = stripHtml(genericMatch[1]);
-      }
-    }
-    if (title && title.length > 1 && url) {
-      results.push({ url, title, summary });
-    }
-  }
-  return results;
-}
+
 
 function parseDuckDuckGo(html: string): SearchItem[] {
   const results: SearchItem[] = [];
@@ -241,25 +235,161 @@ function parseDuckDuckGo(html: string): SearchItem[] {
   return results;
 }
 
+/** Google Search */
+function parseGoogle(html: string): SearchItem[] {
+  const results: SearchItem[] = [];
+  if (
+    html.includes("Enable JavaScript to use search") ||
+    html.includes("sorry/index") ||
+    html.includes("recaptcha")
+  ) {
+    console.log("[Google] Bot detection / JS requirement triggered, skipping");
+    return results;
+  }
+
+  const h3Regex = /<h3[^>]*>([\s\S]*?)<\/h3>/gi;
+  let match;
+  while ((match = h3Regex.exec(html)) !== null) {
+    const title = stripHtml(match[1]);
+    const startIndex = Math.max(0, match.index - 800);
+    const endIndex = Math.min(html.length, match.index + 800);
+    const context = html.substring(startIndex, endIndex);
+
+    const linkMatch =
+      context.match(/<a[^>]+href="([^"]+)"[^>]*>[\s\S]*?<h3/i) ||
+      context.match(/<a[^>]+href="([^"]+)"/i);
+
+    if (!linkMatch) continue;
+    let url = linkMatch[1];
+    if (url.includes("/url?q=")) {
+      const q = url.split("/url?q=")[1]?.split("&")[0];
+      if (q) url = decodeURIComponent(q);
+    }
+
+    if (
+      !url.startsWith("http") ||
+      url.includes("google.com/") ||
+      url.includes("gstatic.com") ||
+      isAdUrl(url)
+    ) {
+      continue;
+    }
+
+    let summary = "";
+    const snippetMatch = context.match(/class="[^"]*VwiC3b[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+    if (snippetMatch) {
+      summary = stripHtml(snippetMatch[1]);
+    }
+
+    if (title && url) {
+      results.push({ url, title, summary });
+    }
+  }
+  return results;
+}
+
 // ============================================================================
 // Search engine requests
 // ============================================================================
 
-async function searchBrave(query: string): Promise<SearchItem[]> {
+/**
+ * Google Search via Gemini API Grounding
+ * 当配置了 GEMINI_API_KEY 时使用 Google 官方 Search Grounding（每月 5000 次免费搜索，免被爬虫拦截）
+ */
+async function searchGoogleGemini(query: string): Promise<SearchItem[]> {
   try {
-    const url = `https://search.brave.com/search?q=${encodeURIComponent(query)}`;
-    const resp = await timedFetch("Brave search", url, {
-      headers: getBrowserHeaders(),
-      signal: AbortSignal.timeout(10000),
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+    const payload = {
+      contents: [
+        {
+          parts: [
+            {
+              text: `Search the web and provide detailed summary with sources for: "${query}"`,
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          google_search: {},
+        },
+      ],
+    };
+
+    const resp = await timedFetch("Google Gemini search", endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(15000),
     });
-    if (!resp.ok) return [];
-    const html = await resp.text();
-    return parseBrave(html);
+
+    if (!resp.ok) {
+      console.error(`[Google Gemini] HTTP ${resp.status}: ${await resp.text()}`);
+      return [];
+    }
+
+    const data = (await resp.json()) as any;
+    const candidate = data.candidates?.[0];
+    const groundingMetadata = candidate?.groundingMetadata;
+    const chunks = groundingMetadata?.groundingChunks || [];
+
+    const modelText =
+      candidate?.content?.parts?.map((p: any) => p.text).filter(Boolean).join("\n") || "";
+
+    const rawItems: SearchItem[] = [];
+    const seenUris = new Set<string>();
+
+    for (const chunk of chunks) {
+      const uri = chunk.web?.uri;
+      const title = chunk.web?.title || "";
+      if (uri && !seenUris.has(uri) && !isAdUrl(uri)) {
+        seenUris.add(uri);
+        rawItems.push({
+          url: uri,
+          title: title || uri,
+          summary: modelText.slice(0, 300),
+        });
+      }
+    }
+
+    const results = await Promise.all(
+      rawItems.map(async (item) => {
+        if (item.url.includes("grounding-api-redirect")) {
+          try {
+            const redirectResp = await timedFetch("Unwrap redirect", item.url, {
+              method: "GET",
+              redirect: "manual",
+              signal: AbortSignal.timeout(3000),
+            });
+            const location = redirectResp.headers.get("location");
+            if (location && location.startsWith("http")) {
+              return { ...item, url: location };
+            }
+          } catch {
+            // 失败时保持原 url
+          }
+        }
+        return item;
+      })
+    );
+
+    return results;
   } catch (e) {
-    console.error("[Brave] search error:", (e as Error).message);
+    console.error("[Google Gemini] search error:", (e as Error).message);
     return [];
   }
 }
+
+async function searchGoogle(query: string): Promise<SearchItem[]> {
+  if (!GEMINI_API_KEY) {
+    return [];
+  }
+  return searchGoogleGemini(query);
+}
+
+
 
 async function fetchDuckDuckGoHtml(url: string): Promise<string> {
   const resp = await timedFetch("DuckDuckGo search", url, {
@@ -370,9 +500,10 @@ function normalizeUrl(url: string): string {
       params.delete(tp);
     }
     const search = params.toString() ? `?${params.toString()}` : "";
+    // 丢弃 hash 锚点
     return `${host}${path}${search}`.toLowerCase();
   } catch {
-    return url.toLowerCase();
+    return url.split("#")[0].toLowerCase();
   }
 }
 
@@ -409,13 +540,19 @@ async function webSearch(
   const startTime = Date.now();
   console.log(`[web_search] query="${query}", numResults=${numResults}`);
   try {
-    const [brave, ddg] = await Promise.allSettled([
-      searchBrave(query),
-      searchDuckDuckGo(query),
-    ]);
+    const tasks: Promise<SearchItem[]>[] = [];
+    const engineNames: string[] = [];
+
+    if (GEMINI_API_KEY) {
+      tasks.push(searchGoogle(query));
+      engineNames.push("Google");
+    }
+
+    tasks.push(searchDuckDuckGo(query));
+    engineNames.push("DuckDuckGo");
+
+    const engineResults = await Promise.allSettled(tasks);
     const allResults: SearchItem[][] = [];
-    const engineNames = ["Brave", "DuckDuckGo"];
-    const engineResults = [brave, ddg];
     for (let i = 0; i < engineResults.length; i++) {
       const result = engineResults[i];
       if (result.status === "fulfilled") {
@@ -594,7 +731,7 @@ export const setupMCPServer = (): McpServer => {
     {
       title: "Web Search",
       description:
-        "Search the web using multiple search engines (Brave, DuckDuckGo) simultaneously. " +
+        "Search the web using search engines (DuckDuckGo, and Google when GEMINI_API_KEY is configured) simultaneously. " +
         "Results are deduplicated and ads are filtered out. " +
         "Returns an array of search results with url, title, and summary.",
       inputSchema: {

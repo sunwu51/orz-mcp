@@ -47,6 +47,7 @@ import { ProxyAgent, fetch as undiciFetch } from "undici";
 function parseArgs() {
   const args = process.argv.slice(2);
   let proxy = "";
+  let geminiApiKey = "";
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--proxy" && i + 1 < args.length) {
@@ -54,6 +55,11 @@ function parseArgs() {
       i++;
     } else if (args[i].startsWith("--proxy=")) {
       proxy = args[i].slice("--proxy=".length);
+    } else if (args[i] === "--gemini-api-key" && i + 1 < args.length) {
+      geminiApiKey = args[i + 1];
+      i++;
+    } else if (args[i].startsWith("--gemini-api-key=")) {
+      geminiApiKey = args[i].slice("--gemini-api-key=".length);
     } else if (args[i] === "--help" || args[i] === "-h") {
       console.error(`
 ORZ MCP Server - Web Search & Fetch
@@ -62,28 +68,32 @@ Usage:
   npx -y orz-mcp [options]
 
 Options:
-  --proxy <url>   HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:7890)
-  -h, --help      Show this help message
+  --proxy <url>             HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:7890)
+  --gemini-api-key <key>    Google Gemini API Key (uses official Google Search Grounding)
+  -h, --help                Show this help message
 
-Environment variables (used as fallback if --proxy is not set):
+Environment variables:
+  GEMINI_API_KEY            Google Gemini API Key
   HTTPS_PROXY, HTTP_PROXY, ALL_PROXY
 
 Examples:
+  npx -y orz-mcp --gemini-api-key AIzaSy...
   npx -y orz-mcp --proxy http://127.0.0.1:7890
-  HTTPS_PROXY=http://127.0.0.1:7890 npx -y orz-mcp
 `);
       process.exit(0);
     }
   }
 
-  return { proxy };
+  return { proxy, geminiApiKey };
 }
 
 // ============================================================================
-// 代理配置
+// 代理与 API 配置
 // ============================================================================
 
 const cliArgs = parseArgs();
+
+const GEMINI_API_KEY = cliArgs.geminiApiKey || process.env.GEMINI_API_KEY || "";
 
 const PROXY_URL =
   cliArgs.proxy ||
@@ -102,6 +112,9 @@ const proxyDispatcher = PROXY_URL
 
 if (PROXY_URL) {
   console.error(`[orz] proxy: ${PROXY_URL}`);
+}
+if (GEMINI_API_KEY) {
+  console.error(`[orz] Google search: Gemini API Grounding enabled`);
 }
 
 // ============================================================================
@@ -214,44 +227,7 @@ function isAdUrl(url) {
 // 搜索引擎解析
 // ============================================================================
 
-/** Brave Search */
-function parseBrave(html) {
-  const results = [];
-  const blocks = html.split('data-type="web"');
-  for (let i = 1; i < blocks.length; i++) {
-    const block = blocks[i].substring(0, 5000);
-
-    const urlMatch = block.match(
-      /<a[^>]+href="(https?:\/\/(?!search\.brave\.com|brave\.com)[^"]+)"/
-    );
-    if (!urlMatch) continue;
-    const url = decodeHtmlEntities(urlMatch[1]);
-
-    const aTagMatch = block.match(
-      /<a[^>]+href="(https?:\/\/(?!search\.brave\.com|brave\.com)[^"]+)"[^>]*>([\s\S]*?)<\/a>/
-    );
-    const title = aTagMatch ? stripHtml(aTagMatch[2]) : "";
-
-    let summary = "";
-    const descMatch = block.match(
-      /class="[^"]*snippet-description[^"]*"[^>]*>([\s\S]*?)<\/(?:p|div|span)>/
-    );
-    if (descMatch) {
-      summary = stripHtml(descMatch[1]);
-    }
-    if (!summary) {
-      const genericMatch = block.match(
-        /class="[^"]*generic-snippet[^"]*"[^>]*>([\s\S]*?)<\/div>/
-      );
-      if (genericMatch) summary = stripHtml(genericMatch[1]);
-    }
-
-    if (title && title.length > 1 && url) {
-      results.push({ url, title, summary });
-    }
-  }
-  return results;
-}
+/** DuckDuckGo */
 
 /** DuckDuckGo */
 function parseDuckDuckGo(html) {
@@ -303,23 +279,161 @@ function parseDuckDuckGo(html) {
   return results;
 }
 
+/** Google Search */
+function parseGoogle(html) {
+  const results = [];
+  if (
+    html.includes("Enable JavaScript to use search") ||
+    html.includes("sorry/index") ||
+    html.includes("recaptcha")
+  ) {
+    console.error("[Google] Bot detection / JS requirement triggered, skipping");
+    return results;
+  }
+
+  const h3Regex = /<h3[^>]*>([\s\S]*?)<\/h3>/gi;
+  let match;
+  while ((match = h3Regex.exec(html)) !== null) {
+    const title = stripHtml(match[1]);
+    const startIndex = Math.max(0, match.index - 800);
+    const endIndex = Math.min(html.length, match.index + 800);
+    const context = html.substring(startIndex, endIndex);
+
+    const linkMatch =
+      context.match(/<a[^>]+href="([^"]+)"[^>]*>[\s\S]*?<h3/i) ||
+      context.match(/<a[^>]+href="([^"]+)"/i);
+
+    if (!linkMatch) continue;
+    let url = linkMatch[1];
+    if (url.includes("/url?q=")) {
+      const q = url.split("/url?q=")[1]?.split("&")[0];
+      if (q) url = decodeURIComponent(q);
+    }
+
+    if (
+      !url.startsWith("http") ||
+      url.includes("google.com/") ||
+      url.includes("gstatic.com") ||
+      isAdUrl(url)
+    ) {
+      continue;
+    }
+
+    let summary = "";
+    const snippetMatch = context.match(/class="[^"]*VwiC3b[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+    if (snippetMatch) {
+      summary = stripHtml(snippetMatch[1]);
+    }
+
+    if (title && url) {
+      results.push({ url, title, summary });
+    }
+  }
+  return results;
+}
+
 // ============================================================================
 // 搜索引擎请求
 // ============================================================================
 
-async function searchBrave(query) {
+/**
+ * Google Search via Gemini API Grounding
+ * 当配置了 GEMINI_API_KEY 时使用 Google 官方 Search Grounding（每月 5000 次免费搜索，免被爬虫拦截）
+ */
+async function searchGoogleGemini(query) {
   try {
-    const url = `https://search.brave.com/search?q=${encodeURIComponent(query)}`;
-    const resp = await proxyFetch(url, {
-      headers: getBrowserHeaders(),
-      signal: AbortSignal.timeout(10000),
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+    const payload = {
+      contents: [
+        {
+          parts: [
+            {
+              text: `Search the web and provide detailed summary with sources for: "${query}"`,
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          google_search: {},
+        },
+      ],
+    };
+
+    const resp = await proxyFetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(15000),
     });
-    if (!resp.ok) return [];
-    return parseBrave(await resp.text());
+
+    if (!resp.ok) {
+      console.error(`[Google Gemini] HTTP ${resp.status}: ${await resp.text()}`);
+      return [];
+    }
+
+    const data = await resp.json();
+    const candidate = data.candidates?.[0];
+    const groundingMetadata = candidate?.groundingMetadata;
+    const chunks = groundingMetadata?.groundingChunks || [];
+
+    // 提炼模型输出的整体总结作为通用 fallback summary
+    const modelText =
+      candidate?.content?.parts?.map((p) => p.text).filter(Boolean).join("\n") || "";
+
+    const rawItems = [];
+    const seenUris = new Set();
+
+    for (const chunk of chunks) {
+      const uri = chunk.web?.uri;
+      const title = chunk.web?.title || "";
+      if (uri && !seenUris.has(uri) && !isAdUrl(uri)) {
+        seenUris.add(uri);
+        rawItems.push({
+          url: uri,
+          title: title || uri,
+          summary: modelText.slice(0, 300),
+        });
+      }
+    }
+
+    // 并发还原 Google 重定向真实 URL，确保跨引擎 URL 去重精准生效
+    const results = await Promise.all(
+      rawItems.map(async (item) => {
+        if (item.url.includes("grounding-api-redirect")) {
+          try {
+            const redirectResp = await proxyFetch(item.url, {
+              method: "GET",
+              redirect: "manual",
+              signal: AbortSignal.timeout(3000),
+            });
+            const location = redirectResp.headers.get("location");
+            if (location && location.startsWith("http")) {
+              return { ...item, url: location };
+            }
+          } catch {
+            // 失败时保持原 url
+          }
+        }
+        return item;
+      })
+    );
+
+    return results;
   } catch (e) {
-    console.error("[Brave] search error:", e.message);
+    console.error("[Google Gemini] search error:", e.message);
     return [];
   }
+}
+
+async function searchGoogle(query) {
+  // 只有配置了 GEMINI_API_KEY 时才开启 Google 搜索（走 Google 官方 Search Grounding，每月 5000 次免费额度）
+  if (!GEMINI_API_KEY) {
+    return [];
+  }
+  return searchGoogleGemini(query);
 }
 
 async function searchDuckDuckGo(query) {
@@ -353,9 +467,11 @@ function normalizeUrl(url) {
     const params = new URLSearchParams(parsed.search);
     for (const tp of trackingParams) params.delete(tp);
     const search = params.toString() ? `?${params.toString()}` : "";
+    // 注意：parsed.hash 默认被丢弃（不拼入返回值），从而完全忽略 #xxx 页面锚点/哈希定位
     return `${host}${path}${search}`.toLowerCase();
   } catch {
-    return url.toLowerCase();
+    // 降级兜底：去除末尾的 # 及其后面的部分
+    return url.split("#")[0].toLowerCase();
   }
 }
 
@@ -385,22 +501,28 @@ function mergeAndDeduplicate(allResults, maxResults) {
 async function webSearch(query, numResults = 8) {
   console.error(`[web_search] query="${query}", numResults=${numResults}`);
 
-  const [brave, ddg] = await Promise.allSettled([
-    searchBrave(query),
-    searchDuckDuckGo(query),
-  ]);
+  const tasks = [];
+  const engineNames = [];
 
+  if (GEMINI_API_KEY) {
+    tasks.push(searchGoogle(query));
+    engineNames.push("Google");
+  }
+
+  tasks.push(searchDuckDuckGo(query));
+  engineNames.push("DuckDuckGo");
+
+  const results = await Promise.allSettled(tasks);
   const allResults = [];
-  const engines = [
-    ["Brave", brave],
-    ["DuckDuckGo", ddg],
-  ];
-  for (const [name, result] of engines) {
-    if (result.status === "fulfilled") {
-      allResults.push(result.value);
-      console.error(`[web_search] ${name}: ${result.value.length} results`);
+
+  for (let i = 0; i < results.length; i++) {
+    const res = results[i];
+    const name = engineNames[i];
+    if (res.status === "fulfilled") {
+      allResults.push(res.value);
+      console.error(`[web_search] ${name}: ${res.value.length} results`);
     } else {
-      console.error(`[web_search] ${name}: failed - ${result.reason}`);
+      console.error(`[web_search] ${name}: failed - ${res.reason}`);
     }
   }
 
@@ -504,7 +626,7 @@ const TOOLS = [
   {
     name: "web_search",
     description:
-      "Search the web using multiple search engines (Brave, DuckDuckGo) simultaneously. " +
+      "Search the web using search engines (DuckDuckGo, and Google when GEMINI_API_KEY is configured) simultaneously. " +
       "Results are deduplicated and ads are filtered out. " +
       "Returns an array of search results with url, title, and summary.",
     inputSchema: {

@@ -8,10 +8,12 @@
 
 ### web_search
 
-同时查询 Brave、DuckDuckGo 两个搜索引擎，自动合并去重、过滤广告。
+并发查询 **DuckDuckGo**（及配置 Key 时开启的 **Google**）搜索引擎，自动合并去重、过滤广告。
 
 - **入参**: `query`（搜索关键词）、`num_results`（返回数量，默认 8）
 - **返回**: `{ url, title, summary }[]`
+- **Google 搜索（官方 Grounding）**：
+  - 配置 `GEMINI_API_KEY`（或 `--gemini-api-key`），直接调用 Google 官方 Gemini API 的 Google Search Grounding（每月拥有 5000 次免费额度，官方实时数据，不惧爬虫风控）。未配置时默认只运行 DuckDuckGo。
 
 ### web_fetch
 
@@ -28,19 +30,19 @@ ORZ MCP 提供 **stdio** 和 **Streamable HTTP** 两种 MCP 传输协议的实�
 | | stdio | Streamable HTTP |
 |---|---|---|
 | 运行方式 | 通过 npx 本地启动 | 远程 HTTP 服务（Netlify Functions） |
-| 适用场景 | 需要代理访问海外搜索引擎 | 开箱即用，无需本地环境 |
-| 代理支持 | 支持 `--proxy` 参数 | 不支持（服务端已部署在海外） |
+| 适用场景 | 本地运行，支持代理与 API Key | 开箱即用，支持云端部署、住宅代理与 API Key |
+| 代理支持 | 支持 `--proxy` 命令行参数与环境变量 | 支持环境变量 `PROXY_URL`（如住宅 IP 代理） |
 | 依赖 | Node.js >= 18 | 无 |
 
 ---
 
 ### 方式一：stdio（通过 npx 本地运行）
 
-无需安装，直接通过 `npx` 运行。适合需要配置代理的用户。
+无需安装，直接通过 `npx` 运行。
 
 在你的 MCP 客户端配置中添加：
 
-**不需要代理：**
+**1. 开启 Gemini 官方 Google Search（推荐）：**
 
 ```json
 {
@@ -48,13 +50,13 @@ ORZ MCP 提供 **stdio** 和 **Streamable HTTP** 两种 MCP 传输协议的实�
     "orz": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "orz-mcp"]
+      "args": ["-y", "orz-mcp", "--gemini-api-key", "AIzaSy..."]
     }
   }
 }
 ```
 
-**需要代理（国内用户）：**
+**2. 配置住宅代理（或科学上网代理）：**
 
 ```json
 {
@@ -62,13 +64,13 @@ ORZ MCP 提供 **stdio** 和 **Streamable HTTP** 两种 MCP 传输协议的实�
     "orz": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "orz-mcp", "--proxy", "http://127.0.0.1:7890"]
+      "args": ["-y", "orz-mcp", "--proxy", "http://user:pass@proxy-host:port"]
     }
   }
 }
 ```
 
-将 `http://127.0.0.1:7890` 替换为你的代理地址。
+也可以两者同时使用（`--gemini-api-key` + `--proxy`）。
 
 ---
 
