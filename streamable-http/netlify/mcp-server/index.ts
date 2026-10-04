@@ -338,18 +338,39 @@ async function searchGoogleGemini(query: string): Promise<SearchItem[]> {
     const modelText =
       candidate?.content?.parts?.map((p: any) => p.text).filter(Boolean).join("\n") || "";
 
+    const supports = groundingMetadata?.groundingSupports || [];
+    const chunkSummaries = new Map<number, string[]>();
+    for (const support of supports) {
+      const indices: number[] = support.groundingChunkIndices || [];
+      const text = support.segment?.text?.trim();
+      if (!text) continue;
+      for (const idx of indices) {
+        if (!chunkSummaries.has(idx)) {
+          chunkSummaries.set(idx, []);
+        }
+        chunkSummaries.get(idx)!.push(text);
+      }
+    }
+
     const rawItems: SearchItem[] = [];
     const seenUris = new Set<string>();
 
-    for (const chunk of chunks) {
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
       const uri = chunk.web?.uri;
       const title = chunk.web?.title || "";
       if (uri && !seenUris.has(uri) && !isAdUrl(uri)) {
         seenUris.add(uri);
+        const specificTexts = chunkSummaries.get(i);
+        const specificSummary =
+          specificTexts && specificTexts.length > 0
+            ? specificTexts.join(" ").slice(0, 300)
+            : modelText.slice(0, 300);
+
         rawItems.push({
           url: uri,
           title: title || uri,
-          summary: modelText.slice(0, 300),
+          summary: specificSummary,
         });
       }
     }

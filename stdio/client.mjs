@@ -383,18 +383,40 @@ async function searchGoogleGemini(query) {
     const modelText =
       candidate?.content?.parts?.map((p) => p.text).filter(Boolean).join("\n") || "";
 
+    // 利用 groundingSupports 建立 chunk 索引 -> 专属引用陈述段落的映射
+    const supports = groundingMetadata?.groundingSupports || [];
+    const chunkSummaries = new Map();
+    for (const support of supports) {
+      const indices = support.groundingChunkIndices || [];
+      const text = support.segment?.text?.trim();
+      if (!text) continue;
+      for (const idx of indices) {
+        if (!chunkSummaries.has(idx)) {
+          chunkSummaries.set(idx, []);
+        }
+        chunkSummaries.get(idx).push(text);
+      }
+    }
+
     const rawItems = [];
     const seenUris = new Set();
 
-    for (const chunk of chunks) {
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
       const uri = chunk.web?.uri;
       const title = chunk.web?.title || "";
       if (uri && !seenUris.has(uri) && !isAdUrl(uri)) {
         seenUris.add(uri);
+        const specificTexts = chunkSummaries.get(i);
+        const specificSummary =
+          specificTexts && specificTexts.length > 0
+            ? specificTexts.join(" ").slice(0, 300)
+            : modelText.slice(0, 300);
+
         rawItems.push({
           url: uri,
           title: title || uri,
-          summary: modelText.slice(0, 300),
+          summary: specificSummary,
         });
       }
     }
