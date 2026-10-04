@@ -13,7 +13,21 @@
 - **入参**: `query`（搜索关键词）、`num_results`（返回数量，默认 8）
 - **返回**: `{ url, title, summary }[]`
 - **Google 搜索（官方 Grounding）**：
-  - 配置 `GEMINI_API_KEY`（或 `--gemini-api-key`），直接调用 Google 官方 Gemini API 的 Google Search Grounding（每月拥有 5000 次免费额度，官方实时数据，不惧爬虫风控）。未配置时默认只运行 DuckDuckGo。
+  - 配置 `GEMINI_API_KEY`（或 `--gemini-api-key`），直接调用 Google 官方 Gemini API 的 Google Search Grounding（每月拥有 5000 次免费额度，官方实时数据，不惧爬虫风控）。未配置时默认只运行 DuckDuckGo。详细开启步骤见下方 [Google Search 配置指南](#google-search-配置指南)。
+
+### Google Search 配置指南
+
+#### 1. 获取 Gemini API Key
+1. 访问 [Google AI Studio](https://aistudio.google.com/app/apikey)。
+2. 点击 **Create API Key** 创建你的 API Key。
+3. **重要说明**：Google Search Grounding 功能要求项目绑定结算账户（开启 Pay-as-you-go / Tier 1）。绑定后**每月享有前 5,000 次免费查询**（查询计费为 $0.00），超出部分才按 $35/1000次 计费。未绑定结算账户的项目调用 Grounding 搜索会报错。
+
+#### 2. 如何开启
+- **stdio（本地使用）**：
+  - 方式 A（推荐，命令行参数）：通过 `--gemini-api-key <YOUR_KEY>` 传入。
+  - 方式 B（环境变量）：在配置文件的 `env` 中设置 `GEMINI_API_KEY`。
+- **Streamable HTTP（云端 Netlify / Railway 部署）**：
+  - 在云平台的控制台环境变量（Environment Variables）中添加 `GEMINI_API_KEY=<YOUR_KEY>` 即可自动生效。
 
 ### web_fetch
 
@@ -44,6 +58,7 @@ ORZ MCP 提供 **stdio** 和 **Streamable HTTP** 两种 MCP 传输协议的实�
 
 **1. 开启 Gemini 官方 Google Search（推荐）：**
 
+使用命令行参数：
 ```json
 {
   "mcpServers": {
@@ -51,6 +66,22 @@ ORZ MCP 提供 **stdio** 和 **Streamable HTTP** 两种 MCP 传输协议的实�
       "type": "stdio",
       "command": "npx",
       "args": ["-y", "orz-mcp", "--gemini-api-key", "AIzaSy..."]
+    }
+  }
+}
+```
+
+或者使用环境变量：
+```json
+{
+  "mcpServers": {
+    "orz": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "orz-mcp"],
+      "env": {
+        "GEMINI_API_KEY": "AIzaSy..."
+      }
     }
   }
 }
