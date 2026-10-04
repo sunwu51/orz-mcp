@@ -20,7 +20,7 @@
 #### 1. 获取 Gemini API Key
 1. 访问 [Google AI Studio](https://aistudio.google.com/app/apikey)。
 2. 点击 **Create API Key** 创建你的 API Key。
-3. **重要说明**：Google Search Grounding 功能要求项目绑定结算账户（开启 Pay-as-you-go / Tier 1）。绑定后**每月享有前 5,000 次免费查询**（查询计费为 $0.00），超出部分才按 $35/1000次 计费。未绑定结算账户的项目调用 Grounding 搜索会报错。
+3. **免费额度与计费说明**：Google Search Grounding 要求绑定结算账户（开启 Pay-as-you-go / Tier 1）。绑定后**每月享有前 5,000 次免费查询**（查询计费为 $0.00），超出后按官方标准 $14 / 1,000 次计费（详见 [Gemini API 官方定价](https://ai.google.dev/pricing)）。未绑定结算账户的项目无法调用 Grounding 搜索。
 
 #### 2. 如何开启
 - **stdio（本地使用）**：
