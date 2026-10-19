@@ -34,6 +34,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import TurndownService from "turndown";
+import { gfm } from "turndown-plugin-gfm";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 
 // ============================================================================
@@ -205,6 +206,10 @@ function isAdUrl(url) {
     /\/click\?/i,
     /\/aclk\?/i,
     /\/pagead\//i,
+    // 非内容类的第三方/基础设施链接
+    /\/\/platform\.twitter\.com/i,
+    /\/\/analytics\./i,
+    /\/cdn-cgi\//i,
   ];
   return adPatterns.some((p) => p.test(url));
 }
@@ -344,18 +349,33 @@ async function webSearch(query, numResults = 8) {
 // web_fetch
 // ============================================================================
 
+/** meta refresh 最多跟随的次数 */
+const MAX_REFRESH_HOPS = 2;
+
+/** 有成对闭合标签的噪音标签 */
+const PAIRED_NOISE_TAGS = [
+  "script", "style", "iframe", "noscript", "svg",
+  "object", "embed", "applet", "head", "nav", "footer", "aside",
+];
+/** 没有闭合标签的噪音标签（void element） */
+const VOID_NOISE_TAGS = ["meta", "link"];
+
+/**
+ * 删除噪音标签。
+ * 标签名后用 (?=[\s/>]) 限定边界，避免 <head 误匹配 <header；
+ * void 标签（<link>、<meta>）不能按「到下一个 />」懒匹配，否则会吞掉后面的正文。
+ */
 function removeUselessTags(html) {
-  const tags = [
-    "script", "style", "iframe", "noscript", "svg",
-    "object", "embed", "applet", "link", "meta",
-    "head", "nav", "footer", "aside",
-  ];
   let cleaned = html;
-  for (const tag of tags) {
+  for (const tag of PAIRED_NOISE_TAGS) {
+    cleaned = cleaned.replace(new RegExp(`<${tag}(?=[\\s/>])[^>]*\\/>`, "gi"), "");
     cleaned = cleaned.replace(
-      new RegExp(`<${tag}[\\s\\S]*?(?:<\\/${tag}>|\\/>)`, "gi"),
+      new RegExp(`<${tag}(?=[\\s/>])[^>]*>[\\s\\S]*?<\\/${tag}\\s*>`, "gi"),
       ""
     );
+  }
+  for (const tag of VOID_NOISE_TAGS) {
+    cleaned = cleaned.replace(new RegExp(`<${tag}(?=[\\s/>])[^>]*>`, "gi"), "");
   }
   return cleaned.replace(/<!--[\s\S]*?-->/g, "");
 }
@@ -365,6 +385,21 @@ function htmlToMarkdown(html) {
     headingStyle: "atx",
     codeBlockStyle: "fenced",
     bulletListMarker: "-",
+  });
+  td.use(gfm);
+  // 默认规则只处理 <pre><code>，裸 <pre> 会丢换行；统一取 textContent 保留原始排版
+  td.addRule("preBlock", {
+    filter: "pre",
+    replacement: (_content, node) => {
+      const cls =
+        node.querySelector?.("code")?.getAttribute("class") ||
+        node.getAttribute("class") ||
+        "";
+      const lang = cls.match(/(?:language|lang)-([\w+#-]+)/)?.[1] ?? "";
+      const text = (node.textContent ?? "").replace(/\n$/, "");
+      const fence = text.includes("```") ? "~~~" : "```";
+      return `\n\n${fence}${lang}\n${text}\n${fence}\n\n`;
+    },
   });
   td.remove(["script", "style", "iframe", "noscript", "svg", "nav", "footer"]);
   try {
@@ -376,18 +411,92 @@ function htmlToMarkdown(html) {
   }
 }
 
-function extractMainContent(html) {
-  for (const [tag] of [["main"], ["article"]]) {
-    const m = html.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
-    if (m) return m[1];
+/**
+ * 从 from 位置起找第一个匹配 openRe 的元素，按同名标签嵌套深度配对其闭合标签。
+ * 返回内部 HTML 与元素结束位置；找不到开始标签返回 null，未闭合则取到文末。
+ */
+function findBalanced(html, openRe, from = 0) {
+  const open = new RegExp(openRe.source, openRe.flags.replace("g", "") + "g");
+  open.lastIndex = from;
+  const m = open.exec(html);
+  if (!m) return null;
+  const tag = m[1].toLowerCase();
+  const start = m.index + m[0].length;
+  const tagRe = new RegExp(`<(\\/?)${tag}(?=[\\s/>])[^>]*>`, "gi");
+  tagRe.lastIndex = start;
+  let depth = 1;
+  let t;
+  while ((t = tagRe.exec(html)) !== null) {
+    depth += t[1] ? -1 : 1;
+    if (depth === 0) {
+      return { inner: html.slice(start, t.index), end: t.index + t[0].length };
+    }
   }
-  const contentMatch = html.match(
-    /<div[^>]*id=["']content["'][^>]*>([\s\S]*?)<\/div>/i
-  );
-  if (contentMatch) return contentMatch[1];
-  const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-  if (bodyMatch) return bodyMatch[1];
-  return html;
+  return { inner: html.slice(start), end: html.length };
+}
+
+function visibleTextLength(html) {
+  return html.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim().length;
+}
+
+function extractMainContent(html) {
+  const body = findBalanced(html, /<(body)\b[^>]*>/i)?.inner ?? html;
+  const bodyLen = visibleTextLength(body);
+
+  let candidate = findBalanced(html, /<(main)\b[^>]*>/i)?.inner ?? null;
+  if (candidate === null) {
+    // 没有 <main> 时，保留全部 <article>（列表页每个条目都是一个 article）
+    const articles = [];
+    for (let pos = 0, a; (a = findBalanced(html, /<(article)\b[^>]*>/i, pos)); pos = a.end) {
+      articles.push(a.inner);
+    }
+    if (articles.length > 0) candidate = articles.join("\n");
+  }
+  if (candidate === null) {
+    candidate =
+      findBalanced(
+        html,
+        /<(div|section)\b[^>]*(?:\bid=["'](?:content|main-content|main)["']|\brole=["']main["'])[^>]*>/i
+      )?.inner ?? null;
+  }
+
+  // 候选区域几乎没有文字（例如只命中了一张卡片）时回退到整个 body
+  if (candidate !== null) {
+    const len = visibleTextLength(candidate);
+    if (len >= 200 || len >= bodyLen * 0.3) return candidate;
+  }
+  return body;
+}
+
+/** 非文本类型（PDF、图片、压缩包等）无法转换，明确报错而不是返回乱码 */
+function isTextContentType(contentType) {
+  if (!contentType) return true;
+  return /^text\/|json|xml|javascript|yaml|toml|markdown|x-www-form-urlencoded/i.test(contentType);
+}
+
+/** 解析 <meta http-equiv="refresh" content="0; url=..."> 的跳转目标；页面有实际内容时不跟随 */
+function findMetaRefresh(html, baseUrl) {
+  const tag = html.match(/<meta[^>]+http-equiv=["']?refresh["']?[^>]*>/i)?.[0];
+  if (!tag) return null;
+  const content = tag.match(/content=(["'])([\s\S]*?)\1/i)?.[2];
+  const target = content?.match(/url\s*=\s*['"]?([^'";]+)/i)?.[1]?.trim();
+  if (!target) return null;
+  if (visibleTextLength(removeUselessTags(html)) >= 500) return null;
+  try {
+    const next = new URL(decodeHtmlEntities(target), baseUrl);
+    if (!/^https?:$/.test(next.protocol) || next.href === baseUrl) return null;
+    return next.href;
+  } catch {
+    return null;
+  }
+}
+
+function httpError(resp) {
+  let msg = `HTTP ${resp.status}${resp.statusText ? `: ${resp.statusText}` : ""}`;
+  if ([401, 403, 429, 503].includes(resp.status)) {
+    msg += " (the site refused the request; it may block automated access — try a proxy via --proxy or another source)";
+  }
+  return new Error(msg);
 }
 
 async function webFetch(url, maxCharSize = 50000, simplify = true) {
@@ -395,37 +504,59 @@ async function webFetch(url, maxCharSize = 50000, simplify = true) {
     `[web_fetch] url="${url}", maxCharSize=${maxCharSize}, simplify=${simplify}`
   );
 
+  // 超时覆盖整个流程（含读取 body 与 meta refresh 跳转）
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
 
   try {
-    const resp = await proxyFetch(url, {
-      headers: getBrowserHeaders(),
-      signal: controller.signal,
-      redirect: "follow",
-    });
-    clearTimeout(timeoutId);
+    let currentUrl = url;
+    for (let refreshHops = 0; ; refreshHops++) {
+      let resp;
+      try {
+        resp = await proxyFetch(currentUrl, {
+          headers: getBrowserHeaders(),
+          signal: controller.signal,
+          redirect: "follow",
+        });
+      } catch (e) {
+        // undici 只报 "fetch failed"，真正原因（ECONNREFUSED、ENOTFOUND 等）在 cause 里
+        if (e.name !== "AbortError" && e.cause instanceof Error) throw e.cause;
+        throw e;
+      }
+      if (!resp.ok) {
+        resp.body?.cancel().catch(() => {});
+        throw httpError(resp);
+      }
 
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+      const contentType = resp.headers.get("content-type") ?? "";
+      if (!isTextContentType(contentType)) {
+        resp.body?.cancel().catch(() => {});
+        throw new Error(
+          `Unsupported content type "${contentType.split(";")[0]}": only text and HTML pages can be fetched.`
+        );
+      }
 
-    const contentType = resp.headers.get("content-type") ?? "";
-    if (!contentType.includes("html")) {
-      return (await resp.text()).substring(0, maxCharSize);
-    }
+      const body = await resp.text();
+      if (!contentType.includes("html")) return body.substring(0, maxCharSize);
 
-    let html = await resp.text();
-    if (simplify) {
-      html = removeUselessTags(html);
-      const main = extractMainContent(html);
+      const refreshUrl =
+        refreshHops < MAX_REFRESH_HOPS ? findMetaRefresh(body, resp.url || currentUrl) : null;
+      if (refreshUrl) {
+        currentUrl = refreshUrl;
+        continue;
+      }
+
+      if (!simplify) return body.substring(0, maxCharSize);
+      const main = extractMainContent(removeUselessTags(body));
       return htmlToMarkdown(main).substring(0, maxCharSize);
     }
-    return html.substring(0, maxCharSize);
   } catch (e) {
-    clearTimeout(timeoutId);
     if (e.name === "AbortError") {
       throw new Error(`Timeout: Failed to fetch "${url}" within 10 seconds.`);
     }
     throw e;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 

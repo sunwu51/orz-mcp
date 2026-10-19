@@ -19,7 +19,9 @@
 
 - **入参**: `url`、`max_char_size`（最大字符数，默认 50000）、`simplify`（是否简化，默认 true）
 - **返回**: 纯文本字符串（Markdown 格式）
-- 内置 10 秒超时
+- 内置 10 秒超时（覆盖重定向、`<meta refresh>` 跳转和读取正文）
+- 支持表格（GFM）、保留代码块换行；PDF、图片等非文本类型会明确报错，不返回乱码
+- Streamable HTTP 版内置 SSRF 防护：拒绝回环、内网、链路本地（如云元数据 `169.254.169.254`）等地址，每次重定向都会重新校验
 
 ## 两种使用方式（二选一）
 
@@ -162,6 +164,13 @@ netlify deploy --prod
 ```
 
 或者通过 GitHub 连接 Netlify，push 到 main 分支自动部署。
+
+### 环境变量
+
+| 变量 | 说明 |
+|---|---|
+| `PROXY_URL` | 出站代理（如住宅 IP 代理）。配置后域名由代理解析，SSRF 防护只校验 IP 字面量和 `localhost`、`.local`、`.internal` 等名称 |
+| `ORZ_ALLOW_PRIVATE_HOSTS` | 逗号分隔的主机名/IP 白名单，允许 `web_fetch` 访问其中的内网地址（精确匹配）。默认为空，即全部拒绝；仅在本地调试需要抓取 `127.0.0.1` 等地址时设置 |
 
 ## License
 

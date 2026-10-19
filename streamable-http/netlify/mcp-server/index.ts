@@ -8,8 +8,12 @@
 
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import dns from "node:dns";
+import net from "node:net";
 import TurndownService from "turndown";
-import { ProxyAgent, fetch as undiciFetch } from "undici";
+// @ts-ignore -- turndown-plugin-gfm ships no type declarations
+import { gfm } from "turndown-plugin-gfm";
+import { Agent, ProxyAgent, fetch as undiciFetch } from "undici";
 
 // ============================================================================
 // Proxy & Config
@@ -30,6 +34,17 @@ const proxyDispatcher = PROXY_URL ? new ProxyAgent(PROXY_URL) : undefined;
 if (PROXY_URL) {
   console.log(`[streamable-http] Using proxy: ${PROXY_URL}`);
 }
+
+/**
+ * Hosts web_fetch may reach even though they are private/loopback
+ * (comma-separated, exact match). Empty by default: all private ranges are blocked.
+ */
+const ALLOWED_PRIVATE_HOSTS = new Set(
+  (process.env.ORZ_ALLOW_PRIVATE_HOSTS || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+);
 
 const DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/";
 const DUCKDUCKGO_FALLBACK_SEARCH_URLS = [
@@ -175,6 +190,10 @@ function isAdUrl(url: string): boolean {
     /\/click\?/i,
     /\/aclk\?/i,
     /\/pagead\//i,
+    // Non-content third-party / infrastructure links
+    /\/\/platform\.twitter\.com/i,
+    /\/\/analytics\./i,
+    /\/cdn-cgi\//i,
   ];
   return adPatterns.some((p) => p.test(url));
 }
@@ -235,10 +254,19 @@ function parseDuckDuckGo(html: string): SearchItem[] {
 // ============================================================================
 
 
-async function fetchDuckDuckGoHtml(url: string): Promise<string> {
+/** The primary endpoint is normally fast; give up early so fallbacks can take over */
+const DUCKDUCKGO_PRIMARY_TIMEOUT_MS = 3000;
+const DUCKDUCKGO_FALLBACK_TIMEOUT_MS = 4000;
+/** If the primary has not answered after this long, start the fallbacks in parallel */
+const DUCKDUCKGO_HEDGE_DELAY_MS = 1500;
+const DUCKDUCKGO_MAX_FALLBACK_ATTEMPTS = 3;
+/** Upper bound for a whole search (Netlify functions time out at 10s by default) */
+const DUCKDUCKGO_TOTAL_TIMEOUT_MS = 8000;
+
+async function fetchDuckDuckGoHtml(url: string, timeoutMs: number): Promise<string> {
   const resp = await timedFetch("DuckDuckGo search", url, {
     headers: getBrowserHeaders(),
-    signal: AbortSignal.timeout(10000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
   if (!resp.ok) {
@@ -262,11 +290,12 @@ function buildDuckDuckGoSearchUrl(baseUrl: string, query: string): string {
 
 async function tryDuckDuckGoSearchUrl(
   url: string,
-  source: string
+  source: string,
+  timeoutMs: number
 ): Promise<DuckDuckGoSearchAttempt> {
   try {
     console.log(`[DuckDuckGo] Trying ${source}: ${url}`);
-    const html = await fetchDuckDuckGoHtml(url);
+    const html = await fetchDuckDuckGoHtml(url, timeoutMs);
 
     if (isDuckDuckGoCaptchaHtml(html)) {
       console.log(`[DuckDuckGo] ${source} returned captcha`);
@@ -286,35 +315,77 @@ async function tryDuckDuckGoSearchUrl(
   }
 }
 
-async function retryDuckDuckGoViaFallbacks(query: string): Promise<SearchItem[]> {
-  const fallbackBaseUrls = [...DUCKDUCKGO_FALLBACK_SEARCH_URLS].sort(() => Math.random() - 0.5);
+/** Try fallback endpoints one by one; null when none of them produced an answer */
+async function retryDuckDuckGoViaFallbacks(query: string): Promise<SearchItem[] | null> {
+  const fallbackBaseUrls = [...DUCKDUCKGO_FALLBACK_SEARCH_URLS]
+    .sort(() => Math.random() - 0.5)
+    .slice(0, DUCKDUCKGO_MAX_FALLBACK_ATTEMPTS);
   for (const fallbackBaseUrl of fallbackBaseUrls) {
     const fallbackUrl = buildDuckDuckGoSearchUrl(fallbackBaseUrl, query);
-    const attempt = await tryDuckDuckGoSearchUrl(fallbackUrl, "fallback");
+    const attempt = await tryDuckDuckGoSearchUrl(
+      fallbackUrl,
+      "fallback",
+      DUCKDUCKGO_FALLBACK_TIMEOUT_MS
+    );
     if (attempt.kind === "success" || attempt.kind === "empty") {
       return attempt.results;
     }
-    if (attempt.kind !== "captcha") {
-      return [];
-    }
   }
 
-  return [];
+  return null;
+}
+
+/** Resolves with the first non-null value, or null once every task has finished without one */
+function firstNonNull<T>(tasks: Promise<T | null>[]): Promise<T | null> {
+  return new Promise((resolve) => {
+    let pending = tasks.length;
+    if (pending === 0) return resolve(null);
+    for (const task of tasks) {
+      task
+        .then((value) => {
+          if (value !== null) resolve(value);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (--pending === 0) resolve(null);
+        });
+    }
+  });
 }
 
 async function searchDuckDuckGo(query: string): Promise<SearchItem[]> {
   const primaryUrl = buildDuckDuckGoSearchUrl(DUCKDUCKGO_HTML_SEARCH_URL, query);
-  const primaryAttempt = await tryDuckDuckGoSearchUrl(primaryUrl, "primary");
+  let primaryWon = false;
 
-  if (primaryAttempt.kind === "success" || primaryAttempt.kind === "empty") {
-    return primaryAttempt.results;
-  }
+  const primaryTask = tryDuckDuckGoSearchUrl(
+    primaryUrl,
+    "primary",
+    DUCKDUCKGO_PRIMARY_TIMEOUT_MS
+  ).then((attempt) => {
+    if (attempt.kind === "success" || attempt.kind === "empty") {
+      primaryWon = true;
+      return attempt.results;
+    }
+    return null;
+  });
 
-  if (primaryAttempt.kind !== "captcha") {
-    return [];
-  }
+  // Hedged request: start the fallbacks as soon as the primary fails, or when it is slow.
+  // A fast successful primary never touches the fallback services.
+  const startFallbacks = new Promise<void>((resolve) => {
+    setTimeout(resolve, DUCKDUCKGO_HEDGE_DELAY_MS);
+    primaryTask.then((results) => {
+      if (results === null) resolve();
+    });
+  });
+  const fallbackTask = startFallbacks.then(() =>
+    primaryWon ? null : retryDuckDuckGoViaFallbacks(query)
+  );
 
-  return retryDuckDuckGoViaFallbacks(query);
+  // Hard cap so a search never outlives the serverless function limit
+  const deadline = new Promise<null>((resolve) =>
+    setTimeout(() => resolve(null), DUCKDUCKGO_TOTAL_TIMEOUT_MS)
+  );
+  return (await Promise.race([firstNonNull([primaryTask, fallbackTask]), deadline])) ?? [];
 }
 
 // ============================================================================
@@ -404,30 +475,42 @@ async function webSearch(
 // web_fetch
 // ============================================================================
 
+/** Noise tags that have a closing tag */
+const PAIRED_NOISE_TAGS = [
+  "script",
+  "style",
+  "iframe",
+  "noscript",
+  "svg",
+  "object",
+  "embed",
+  "applet",
+  "head",
+  "nav",
+  "footer",
+  "aside",
+];
+/** Noise tags without a closing tag (void elements) */
+const VOID_NOISE_TAGS = ["meta", "link"];
+
+/**
+ * Remove noise tags. The (?=[\s/>]) boundary stops `<head` from matching `<header`;
+ * void tags (<link>, <meta>) must not be matched lazily up to the next `/>`,
+ * which used to swallow the page body.
+ */
 function removeUselessTags(html: string): string {
-  const tagsToRemove = [
-    "script",
-    "style",
-    "iframe",
-    "noscript",
-    "svg",
-    "object",
-    "embed",
-    "applet",
-    "link",
-    "meta",
-    "head",
-    "nav",
-    "footer",
-    "aside",
-  ];
   let cleaned = html;
-  for (const tag of tagsToRemove) {
-    const regex = new RegExp(`<${tag}[\\s\\S]*?(?:<\\/${tag}>|\\/>)`, "gi");
-    cleaned = cleaned.replace(regex, "");
+  for (const tag of PAIRED_NOISE_TAGS) {
+    cleaned = cleaned.replace(new RegExp(`<${tag}(?=[\\s/>])[^>]*\\/>`, "gi"), "");
+    cleaned = cleaned.replace(
+      new RegExp(`<${tag}(?=[\\s/>])[^>]*>[\\s\\S]*?<\\/${tag}\\s*>`, "gi"),
+      ""
+    );
   }
-  cleaned = cleaned.replace(/<!--[\s\S]*?-->/g, "");
-  return cleaned;
+  for (const tag of VOID_NOISE_TAGS) {
+    cleaned = cleaned.replace(new RegExp(`<${tag}(?=[\\s/>])[^>]*>`, "gi"), "");
+  }
+  return cleaned.replace(/<!--[\s\S]*?-->/g, "");
 }
 
 function htmlToMarkdown(html: string): string {
@@ -435,6 +518,22 @@ function htmlToMarkdown(html: string): string {
     headingStyle: "atx",
     codeBlockStyle: "fenced",
     bulletListMarker: "-",
+  });
+  turndownService.use(gfm);
+  // The default rule only handles <pre><code>; a bare <pre> loses its line breaks.
+  // Use textContent so the original layout is kept.
+  turndownService.addRule("preBlock", {
+    filter: "pre",
+    replacement: (_content: string, node: any) => {
+      const cls: string =
+        node.querySelector?.("code")?.getAttribute("class") ||
+        node.getAttribute("class") ||
+        "";
+      const lang = cls.match(/(?:language|lang)-([\w+#-]+)/)?.[1] ?? "";
+      const text = String(node.textContent ?? "").replace(/\n$/, "");
+      const fence = text.includes("```") ? "~~~" : "```";
+      return `\n\n${fence}${lang}\n${text}\n${fence}\n\n`;
+    },
   });
   turndownService.remove([
     "script",
@@ -459,18 +558,244 @@ function htmlToMarkdown(html: string): string {
   }
 }
 
+/**
+ * Find the first element matching openRe (group 1 must capture the tag name),
+ * starting at `from`, and pair its closing tag by same-name nesting depth.
+ * Returns null when no opening tag is found; an unclosed element runs to the end.
+ */
+function findBalanced(
+  html: string,
+  openRe: RegExp,
+  from: number = 0
+): { inner: string; end: number } | null {
+  const open = new RegExp(openRe.source, openRe.flags.replace("g", "") + "g");
+  open.lastIndex = from;
+  const m = open.exec(html);
+  if (!m) return null;
+  const tag = m[1].toLowerCase();
+  const start = m.index + m[0].length;
+  const tagRe = new RegExp(`<(\\/?)${tag}(?=[\\s/>])[^>]*>`, "gi");
+  tagRe.lastIndex = start;
+  let depth = 1;
+  let t: RegExpExecArray | null;
+  while ((t = tagRe.exec(html)) !== null) {
+    depth += t[1] ? -1 : 1;
+    if (depth === 0) {
+      return { inner: html.slice(start, t.index), end: t.index + t[0].length };
+    }
+  }
+  return { inner: html.slice(start), end: html.length };
+}
+
+function visibleTextLength(html: string): number {
+  return html.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim().length;
+}
+
 function extractMainContent(html: string): string {
-  const mainMatch = html.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
-  if (mainMatch) return mainMatch[1];
-  const articleMatch = html.match(/<article[^>]*>([\s\S]*?)<\/article>/i);
-  if (articleMatch) return articleMatch[1];
-  const contentMatch = html.match(
-    /<div[^>]*id=["']content["'][^>]*>([\s\S]*?)<\/div>/i
+  const body = findBalanced(html, /<(body)\b[^>]*>/i)?.inner ?? html;
+  const bodyLen = visibleTextLength(body);
+
+  let candidate: string | null = findBalanced(html, /<(main)\b[^>]*>/i)?.inner ?? null;
+  if (candidate === null) {
+    // Without <main>, keep every <article> (listing pages use one per entry)
+    const articles: string[] = [];
+    let pos = 0;
+    for (let a; (a = findBalanced(html, /<(article)\b[^>]*>/i, pos)); pos = a.end) {
+      articles.push(a.inner);
+    }
+    if (articles.length > 0) candidate = articles.join("\n");
+  }
+  if (candidate === null) {
+    candidate =
+      findBalanced(
+        html,
+        /<(div|section)\b[^>]*(?:\bid=["'](?:content|main-content|main)["']|\brole=["']main["'])[^>]*>/i
+      )?.inner ?? null;
+  }
+
+  // If the candidate has almost no text (e.g. it matched a single card), use the whole body
+  if (candidate !== null) {
+    const len = visibleTextLength(candidate);
+    if (len >= 200 || len >= bodyLen * 0.3) return candidate;
+  }
+  return body;
+}
+
+/** Binary types (PDF, images, archives...) cannot be converted: fail loudly instead of returning garbage */
+function isTextContentType(contentType: string): boolean {
+  if (!contentType) return true;
+  return /^text\/|json|xml|javascript|yaml|toml|markdown|x-www-form-urlencoded/i.test(contentType);
+}
+
+/** Target of <meta http-equiv="refresh" content="0; url=...">; ignored when the page has real content */
+function findMetaRefresh(html: string, baseUrl: string): string | null {
+  const tag = html.match(/<meta[^>]+http-equiv=["']?refresh["']?[^>]*>/i)?.[0];
+  if (!tag) return null;
+  const content = tag.match(/content=(["'])([\s\S]*?)\1/i)?.[2];
+  const target = content?.match(/url\s*=\s*['"]?([^'";]+)/i)?.[1]?.trim();
+  if (!target) return null;
+  if (visibleTextLength(removeUselessTags(html)) >= 500) return null;
+  try {
+    const next = new URL(decodeHtmlEntities(target), baseUrl);
+    if (!/^https?:$/.test(next.protocol) || next.href === baseUrl) return null;
+    return next.href;
+  } catch {
+    return null;
+  }
+}
+
+function httpError(resp: Response): Error {
+  let msg = `HTTP ${resp.status}${resp.statusText ? `: ${resp.statusText}` : ""}`;
+  if ([401, 403, 429, 503].includes(resp.status)) {
+    msg +=
+      " (the site refused the request; it may block automated access — configure PROXY_URL or try another source)";
+  }
+  return new Error(msg);
+}
+
+// ----------------------------------------------------------------------------
+// SSRF protection
+// web_fetch is reachable by anyone who can reach the public /mcp endpoint, so it
+// must not be usable to read loopback / link-local (cloud metadata) / private
+// networks. Every hop (including redirects) is validated before a request is made.
+// ----------------------------------------------------------------------------
+
+const MAX_REDIRECT_HOPS = 5;
+const MAX_REFRESH_HOPS = 2;
+
+const privateRanges = new net.BlockList();
+for (const [addr, prefix] of [
+  ["0.0.0.0", 8], // "this" network
+  ["10.0.0.0", 8],
+  ["100.64.0.0", 10], // carrier-grade NAT
+  ["127.0.0.0", 8], // loopback
+  ["169.254.0.0", 16], // link-local, incl. cloud metadata 169.254.169.254
+  ["172.16.0.0", 12],
+  ["192.0.0.0", 24],
+  ["192.168.0.0", 16],
+  ["198.18.0.0", 15], // benchmarking
+  ["224.0.0.0", 4], // multicast
+  ["240.0.0.0", 4], // reserved + broadcast
+] as const) {
+  privateRanges.addSubnet(addr, prefix, "ipv4");
+}
+for (const [addr, prefix] of [
+  ["::", 128], // unspecified
+  ["::1", 128], // loopback
+  ["64:ff9b::", 96], // NAT64 (can embed a private IPv4)
+  ["100::", 64], // discard-only
+  ["2001::", 32], // Teredo
+  ["2001:db8::", 32], // documentation
+  ["2002::", 16], // 6to4 (can embed a private IPv4)
+  ["fc00::", 7], // unique local
+  ["fe80::", 10], // link-local
+  ["ff00::", 8], // multicast
+] as const) {
+  privateRanges.addSubnet(addr, prefix, "ipv6");
+}
+
+/** IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) are matched against the IPv4 ranges */
+function isPrivateIp(ip: string): boolean {
+  const family = net.isIPv6(ip) ? "ipv6" : "ipv4";
+  return privateRanges.check(ip, family);
+}
+
+function blockedError(host: string): Error {
+  return new Error(
+    `Blocked: "${host}" is a private or internal address and cannot be fetched.`
   );
-  if (contentMatch) return contentMatch[1];
-  const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-  if (bodyMatch) return bodyMatch[1];
-  return html;
+}
+
+/** Validate scheme and destination of one request URL. Throws "Blocked: ..." when not allowed. */
+async function assertPublicHttpUrl(url: URL): Promise<void> {
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`Blocked: unsupported URL scheme "${url.protocol}" (only http and https).`);
+  }
+  // WHATWG URL already normalises decimal/hex/octal IPv4 forms to dotted quad
+  const host = url.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  if (ALLOWED_PRIVATE_HOSTS.has(host)) return;
+
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal")
+  ) {
+    throw blockedError(host);
+  }
+  if (net.isIP(host)) {
+    if (isPrivateIp(host)) throw blockedError(host);
+    return;
+  }
+  // Behind a proxy the proxy resolves the name; a local lookup would be meaningless
+  // (e.g. fake-ip DNS) and the connect-time guard below does not apply.
+  if (proxyDispatcher) return;
+
+  const addresses = await dns.promises.lookup(host, { all: true });
+  if (addresses.some((a) => isPrivateIp(a.address))) throw blockedError(host);
+}
+
+/** Connect-time DNS check, so a name cannot resolve to a public IP above and a private IP here (DNS rebinding) */
+function guardedLookup(hostname: string, options: any, callback: (...args: any[]) => void) {
+  dns.lookup(hostname, options, (err: any, address: any, family: any) => {
+    if (err) return callback(err, address, family);
+    const list: Array<{ address: string }> = Array.isArray(address)
+      ? address
+      : [{ address }];
+    if (!ALLOWED_PRIVATE_HOSTS.has(hostname.toLowerCase()) && list.some((a) => isPrivateIp(a.address))) {
+      return callback(blockedError(hostname));
+    }
+    callback(null, address, family);
+  });
+}
+
+const guardedAgent = new Agent({ connect: { lookup: guardedLookup as any } });
+
+/**
+ * GET with manual redirect handling so every hop is validated.
+ * Returns the final response and its URL.
+ */
+async function safeFetch(
+  startUrl: string,
+  signal: AbortSignal
+): Promise<{ resp: Response; finalUrl: string }> {
+  let current: URL;
+  try {
+    current = new URL(startUrl);
+  } catch {
+    throw new Error(`Invalid URL: "${startUrl}"`);
+  }
+
+  for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
+    await assertPublicHttpUrl(current);
+    const startTime = Date.now();
+    let resp: Response;
+    try {
+      resp = (await undiciFetch(current.href, {
+        headers: getBrowserHeaders(),
+        signal,
+        redirect: "manual",
+        dispatcher: proxyDispatcher ?? guardedAgent,
+      })) as unknown as Response;
+    } catch (e) {
+      // undici reports only "fetch failed"; the useful reason (ECONNREFUSED, Blocked, ...) is the cause
+      const cause = (e as any)?.cause;
+      if ((e as Error).name !== "AbortError" && cause instanceof Error) throw cause;
+      throw e;
+    }
+    console.log(
+      `[fetch] web_fetch completed in ${getElapsedMs(startTime)}ms (${resp.status}) url="${current.href}"`
+    );
+
+    const location = resp.headers.get("location");
+    if (resp.status >= 300 && resp.status < 400 && location) {
+      resp.body?.cancel().catch(() => {});
+      current = new URL(location, current);
+      continue;
+    }
+    return { resp, finalUrl: current.href };
+  }
+  throw new Error(`Too many redirects (more than ${MAX_REDIRECT_HOPS}).`);
 }
 
 async function webFetch(
@@ -482,46 +807,49 @@ async function webFetch(
   console.log(
     `[web_fetch] url="${url}", maxCharSize=${maxCharSize}, simplify=${simplify}`
   );
+  // The timeout covers the whole flow, including reading the body and meta-refresh hops
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
+  const done = (result: string): string => {
+    console.log(
+      `[web_fetch] total completed in ${getElapsedMs(startTime)}ms, contentLength=${result.length}`
+    );
+    return result;
+  };
   try {
-    const resp = await timedFetch("web_fetch", url, {
-      headers: getBrowserHeaders(),
-      signal: controller.signal,
-      redirect: "follow",
-    });
-    clearTimeout(timeoutId);
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
-    }
-    const contentType = resp.headers.get("content-type") ?? "";
-    if (!contentType.includes("html")) {
-      const text = await resp.text();
-      const result = text.substring(0, maxCharSize);
-      console.log(
-        `[web_fetch] total completed in ${getElapsedMs(startTime)}ms, contentLength=${result.length}`
-      );
-      return result;
-    }
-    let html = await resp.text();
-    if (simplify) {
-      html = removeUselessTags(html);
-      const mainContent = extractMainContent(html);
-      const markdown = htmlToMarkdown(mainContent);
-      const result = markdown.substring(0, maxCharSize);
-      console.log(
-        `[web_fetch] total completed in ${getElapsedMs(startTime)}ms, contentLength=${result.length}`
-      );
-      return result;
-    } else {
-      const result = html.substring(0, maxCharSize);
-      console.log(
-        `[web_fetch] total completed in ${getElapsedMs(startTime)}ms, contentLength=${result.length}`
-      );
-      return result;
+    let currentUrl = url;
+    for (let refreshHops = 0; ; refreshHops++) {
+      const { resp, finalUrl } = await safeFetch(currentUrl, controller.signal);
+      if (!resp.ok) {
+        resp.body?.cancel().catch(() => {});
+        throw httpError(resp);
+      }
+
+      const contentType = resp.headers.get("content-type") ?? "";
+      if (!isTextContentType(contentType)) {
+        resp.body?.cancel().catch(() => {});
+        throw new Error(
+          `Unsupported content type "${contentType.split(";")[0]}": only text and HTML pages can be fetched.`
+        );
+      }
+
+      const body = await resp.text();
+      if (!contentType.includes("html")) {
+        return done(body.substring(0, maxCharSize));
+      }
+
+      const refreshUrl =
+        refreshHops < MAX_REFRESH_HOPS ? findMetaRefresh(body, finalUrl) : null;
+      if (refreshUrl) {
+        currentUrl = refreshUrl;
+        continue;
+      }
+
+      if (!simplify) return done(body.substring(0, maxCharSize));
+      const mainContent = extractMainContent(removeUselessTags(body));
+      return done(htmlToMarkdown(mainContent).substring(0, maxCharSize));
     }
   } catch (e) {
-    clearTimeout(timeoutId);
     console.error(
       `[web_fetch] total failed in ${getElapsedMs(startTime)}ms: ${(e as Error).message}`
     );
@@ -529,6 +857,8 @@ async function webFetch(
       throw new Error(`Timeout: Failed to fetch "${url}" within 10 seconds.`);
     }
     throw e;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
