@@ -8,8 +8,8 @@
  *
  * 特性:
  * - 支持 HTTP/HTTPS 代理（命令行参数 --proxy 或环境变量兜底）
- *   方便国内用户通过 VPN 访问 Brave 等海外搜索引擎
- * - 同时查询 Brave、DuckDuckGo，合并去重
+ *   方便国内用户通过 VPN 访问海外搜索引擎
+ * - 通过 DuckDuckGo 搜索，过滤广告
  * - 抓取网页内容，可选简化为 Markdown
  *
  * 使用:
@@ -47,7 +47,6 @@ import { ProxyAgent, fetch as undiciFetch } from "undici";
 function parseArgs() {
   const args = process.argv.slice(2);
   let proxy = "";
-  let geminiApiKey = "";
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--proxy" && i + 1 < args.length) {
@@ -55,11 +54,6 @@ function parseArgs() {
       i++;
     } else if (args[i].startsWith("--proxy=")) {
       proxy = args[i].slice("--proxy=".length);
-    } else if (args[i] === "--gemini-api-key" && i + 1 < args.length) {
-      geminiApiKey = args[i + 1];
-      i++;
-    } else if (args[i].startsWith("--gemini-api-key=")) {
-      geminiApiKey = args[i].slice("--gemini-api-key=".length);
     } else if (args[i] === "--help" || args[i] === "-h") {
       console.error(`
 ORZ MCP Server - Web Search & Fetch
@@ -69,31 +63,26 @@ Usage:
 
 Options:
   --proxy <url>             HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:7890)
-  --gemini-api-key <key>    Google Gemini API Key (uses official Google Search Grounding)
   -h, --help                Show this help message
 
 Environment variables:
-  GEMINI_API_KEY            Google Gemini API Key
   HTTPS_PROXY, HTTP_PROXY, ALL_PROXY
 
 Examples:
-  npx -y orz-mcp --gemini-api-key AIzaSy...
   npx -y orz-mcp --proxy http://127.0.0.1:7890
 `);
       process.exit(0);
     }
   }
 
-  return { proxy, geminiApiKey };
+  return { proxy };
 }
 
 // ============================================================================
-// 代理与 API 配置
+// 代理配置
 // ============================================================================
 
 const cliArgs = parseArgs();
-
-const GEMINI_API_KEY = cliArgs.geminiApiKey || process.env.GEMINI_API_KEY || "";
 
 const PROXY_URL =
   cliArgs.proxy ||
@@ -112,9 +101,6 @@ const proxyDispatcher = PROXY_URL
 
 if (PROXY_URL) {
   console.error(`[orz] proxy: ${PROXY_URL}`);
-}
-if (GEMINI_API_KEY) {
-  console.error(`[orz] Google search: Gemini API Grounding enabled`);
 }
 
 // ============================================================================
@@ -279,184 +265,9 @@ function parseDuckDuckGo(html) {
   return results;
 }
 
-/** Google Search */
-function parseGoogle(html) {
-  const results = [];
-  if (
-    html.includes("Enable JavaScript to use search") ||
-    html.includes("sorry/index") ||
-    html.includes("recaptcha")
-  ) {
-    console.error("[Google] Bot detection / JS requirement triggered, skipping");
-    return results;
-  }
-
-  const h3Regex = /<h3[^>]*>([\s\S]*?)<\/h3>/gi;
-  let match;
-  while ((match = h3Regex.exec(html)) !== null) {
-    const title = stripHtml(match[1]);
-    const startIndex = Math.max(0, match.index - 800);
-    const endIndex = Math.min(html.length, match.index + 800);
-    const context = html.substring(startIndex, endIndex);
-
-    const linkMatch =
-      context.match(/<a[^>]+href="([^"]+)"[^>]*>[\s\S]*?<h3/i) ||
-      context.match(/<a[^>]+href="([^"]+)"/i);
-
-    if (!linkMatch) continue;
-    let url = linkMatch[1];
-    if (url.includes("/url?q=")) {
-      const q = url.split("/url?q=")[1]?.split("&")[0];
-      if (q) url = decodeURIComponent(q);
-    }
-
-    if (
-      !url.startsWith("http") ||
-      url.includes("google.com/") ||
-      url.includes("gstatic.com") ||
-      isAdUrl(url)
-    ) {
-      continue;
-    }
-
-    let summary = "";
-    const snippetMatch = context.match(/class="[^"]*VwiC3b[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-    if (snippetMatch) {
-      summary = stripHtml(snippetMatch[1]);
-    }
-
-    if (title && url) {
-      results.push({ url, title, summary });
-    }
-  }
-  return results;
-}
-
 // ============================================================================
 // 搜索引擎请求
 // ============================================================================
-
-/**
- * Google Search via Gemini API Grounding
- * 当配置了 GEMINI_API_KEY 时使用 Google 官方 Search Grounding（每月 5000 次免费搜索，免被爬虫拦截）
- */
-async function searchGoogleGemini(query) {
-  try {
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-    const payload = {
-      contents: [
-        {
-          parts: [
-            {
-              text: `Search the web and provide detailed summary with sources for: "${query}"`,
-            },
-          ],
-        },
-      ],
-      tools: [
-        {
-          google_search: {},
-        },
-      ],
-    };
-
-    const resp = await proxyFetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(15000),
-    });
-
-    if (!resp.ok) {
-      console.error(`[Google Gemini] HTTP ${resp.status}: ${await resp.text()}`);
-      return [];
-    }
-
-    const data = await resp.json();
-    const candidate = data.candidates?.[0];
-    const groundingMetadata = candidate?.groundingMetadata;
-    const chunks = groundingMetadata?.groundingChunks || [];
-
-    // 提炼模型输出的整体总结作为通用 fallback summary
-    const modelText =
-      candidate?.content?.parts?.map((p) => p.text).filter(Boolean).join("\n") || "";
-
-    // 利用 groundingSupports 建立 chunk 索引 -> 专属引用陈述段落的映射
-    const supports = groundingMetadata?.groundingSupports || [];
-    const chunkSummaries = new Map();
-    for (const support of supports) {
-      const indices = support.groundingChunkIndices || [];
-      const text = support.segment?.text?.trim();
-      if (!text) continue;
-      for (const idx of indices) {
-        if (!chunkSummaries.has(idx)) {
-          chunkSummaries.set(idx, []);
-        }
-        chunkSummaries.get(idx).push(text);
-      }
-    }
-
-    const rawItems = [];
-    const seenUris = new Set();
-
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      const uri = chunk.web?.uri;
-      const title = chunk.web?.title || "";
-      if (uri && !seenUris.has(uri) && !isAdUrl(uri)) {
-        seenUris.add(uri);
-        const specificTexts = chunkSummaries.get(i);
-        const specificSummary =
-          specificTexts && specificTexts.length > 0
-            ? specificTexts.join(" ").slice(0, 300)
-            : modelText.slice(0, 300);
-
-        rawItems.push({
-          url: uri,
-          title: title || uri,
-          summary: specificSummary,
-        });
-      }
-    }
-
-    // 并发还原 Google 重定向真实 URL，确保跨引擎 URL 去重精准生效
-    const results = await Promise.all(
-      rawItems.map(async (item) => {
-        if (item.url.includes("grounding-api-redirect")) {
-          try {
-            const redirectResp = await proxyFetch(item.url, {
-              method: "GET",
-              redirect: "manual",
-              signal: AbortSignal.timeout(3000),
-            });
-            const location = redirectResp.headers.get("location");
-            if (location && location.startsWith("http")) {
-              return { ...item, url: location };
-            }
-          } catch {
-            // 失败时保持原 url
-          }
-        }
-        return item;
-      })
-    );
-
-    return results;
-  } catch (e) {
-    console.error("[Google Gemini] search error:", e.message);
-    return [];
-  }
-}
-
-async function searchGoogle(query) {
-  // 只有配置了 GEMINI_API_KEY 时才开启 Google 搜索（走 Google 官方 Search Grounding，每月 5000 次免费额度）
-  if (!GEMINI_API_KEY) {
-    return [];
-  }
-  return searchGoogleGemini(query);
-}
 
 async function searchDuckDuckGo(query) {
   try {
@@ -523,32 +334,10 @@ function mergeAndDeduplicate(allResults, maxResults) {
 async function webSearch(query, numResults = 8) {
   console.error(`[web_search] query="${query}", numResults=${numResults}`);
 
-  const tasks = [];
-  const engineNames = [];
+  const results = await searchDuckDuckGo(query);
+  console.error(`[web_search] DuckDuckGo: ${results.length} results`);
 
-  if (GEMINI_API_KEY) {
-    tasks.push(searchGoogle(query));
-    engineNames.push("Google");
-  }
-
-  tasks.push(searchDuckDuckGo(query));
-  engineNames.push("DuckDuckGo");
-
-  const results = await Promise.allSettled(tasks);
-  const allResults = [];
-
-  for (let i = 0; i < results.length; i++) {
-    const res = results[i];
-    const name = engineNames[i];
-    if (res.status === "fulfilled") {
-      allResults.push(res.value);
-      console.error(`[web_search] ${name}: ${res.value.length} results`);
-    } else {
-      console.error(`[web_search] ${name}: failed - ${res.reason}`);
-    }
-  }
-
-  return mergeAndDeduplicate(allResults, numResults);
+  return mergeAndDeduplicate([results], numResults);
 }
 
 // ============================================================================
@@ -648,7 +437,7 @@ const TOOLS = [
   {
     name: "web_search",
     description:
-      "Search the web using search engines (DuckDuckGo, and Google when GEMINI_API_KEY is configured) simultaneously. " +
+      "Search the web using DuckDuckGo. " +
       "Results are deduplicated and ads are filtered out. " +
       "Returns an array of search results with url, title, and summary.",
     inputSchema: {

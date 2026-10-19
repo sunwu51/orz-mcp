@@ -8,26 +8,10 @@
 
 ### web_search
 
-并发查询 **DuckDuckGo**（及配置 Key 时开启的 **Google**）搜索引擎，自动合并去重、过滤广告。
+通过 **DuckDuckGo** 搜索网页，自动去重、过滤广告。
 
 - **入参**: `query`（搜索关键词）、`num_results`（返回数量，默认 8）
 - **返回**: `{ url, title, summary }[]`
-- **Google 搜索（官方 Grounding）**：
-  - 配置 `GEMINI_API_KEY`（或 `--gemini-api-key`），直接调用 Google 官方 Gemini API 的 Google Search Grounding（每月拥有 5000 次免费额度，官方实时数据，不惧爬虫风控）。未配置时默认只运行 DuckDuckGo。详细开启步骤见下方 [Google Search 配置指南](#google-search-配置指南)。
-
-### Google Search 配置指南
-
-#### 1. 获取 Gemini API Key
-1. 访问 [Google AI Studio](https://aistudio.google.com/app/apikey)。
-2. 点击 **Create API Key** 创建你的 API Key。
-3. **免费额度与计费说明**：Google Search Grounding 要求绑定结算账户（开启 Pay-as-you-go / Tier 1）。绑定后**每月享有前 5,000 次免费查询**（查询计费为 $0.00），超出后按官方标准 $14 / 1,000 次计费（详见 [Gemini API 官方定价](https://ai.google.dev/pricing)）。未绑定结算账户的项目无法调用 Grounding 搜索。
-
-#### 2. 如何开启
-- **stdio（本地使用）**：
-  - 方式 A（推荐，命令行参数）：通过 `--gemini-api-key <YOUR_KEY>` 传入。
-  - 方式 B（环境变量）：在配置文件的 `env` 中设置 `GEMINI_API_KEY`。
-- **Streamable HTTP（云端 Netlify / Railway 部署）**：
-  - 在云平台的控制台环境变量（Environment Variables）中添加 `GEMINI_API_KEY=<YOUR_KEY>` 即可自动生效。
 
 ### web_fetch
 
@@ -44,7 +28,7 @@ ORZ MCP 提供 **stdio** 和 **Streamable HTTP** 两种 MCP 传输协议的实�
 | | stdio | Streamable HTTP |
 |---|---|---|
 | 运行方式 | 通过 npx 本地启动 | 远程 HTTP 服务（Netlify Functions） |
-| 适用场景 | 本地运行，支持代理与 API Key | 开箱即用，支持云端部署、住宅代理与 API Key |
+| 适用场景 | 本地运行，支持代理 | 开箱即用，支持云端部署、住宅代理 |
 | 代理支持 | 支持 `--proxy` 命令行参数与环境变量 | 支持环境变量 `PROXY_URL`（如住宅 IP 代理） |
 | 依赖 | Node.js >= 18 | 无 |
 
@@ -56,38 +40,7 @@ ORZ MCP 提供 **stdio** 和 **Streamable HTTP** 两种 MCP 传输协议的实�
 
 在你的 MCP 客户端配置中添加：
 
-**1. 开启 Gemini 官方 Google Search（推荐）：**
-
-使用命令行参数：
-```json
-{
-  "mcpServers": {
-    "orz": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "orz-mcp", "--gemini-api-key", "AIzaSy..."]
-    }
-  }
-}
-```
-
-或者使用环境变量：
-```json
-{
-  "mcpServers": {
-    "orz": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "orz-mcp"],
-      "env": {
-        "GEMINI_API_KEY": "AIzaSy..."
-      }
-    }
-  }
-}
-```
-
-**2. 配置住宅代理（或科学上网代理）：**
+**1. 配置住宅代理（或科学上网代理）：**
 
 ```json
 {
@@ -100,8 +53,6 @@ ORZ MCP 提供 **stdio** 和 **Streamable HTTP** 两种 MCP 传输协议的实�
   }
 }
 ```
-
-也可以两者同时使用（`--gemini-api-key` + `--proxy`）。
 
 ---
 
